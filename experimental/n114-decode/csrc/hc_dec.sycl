@@ -1,0 +1,551 @@
+// N114-hc: hyper-connection (GatedResidual) decode kernels for Intel Xe2 (Arc Pro B70) as a torch XPU op library
+// (torch.ops.n114hc.*). Qwen3.8-Flash-Next decode / verify: M = 1..8 token rows share the weights, which are read ONCE
+// for all rows (6.6 MB Wd + 6.6 MB Wu + 80 KB Wi per call at hc 4, hidden 2560, lowrank 320).
+//
+// Port of Strata's fused hyper-connection read (sycl/src/kernels/cuda/fused_gr.dp.cpp + include/strata/kernels/
+// fused_gr.hpp of github.com/Niko1221/Strata, HEAD 82f46a8: fused_gr_read / fused_gr_read_multi, "the HC read in two
+// kernels with the previous half's write folded in", split-K down partials summed in a fixed order by the up kernel).
+// Adapted to SGLang's GatedResidual (layers/hyperconnection.py, compiled _mix_compute / _combine_compute) and its
+// bf16 activations and rounding points (Strata keeps R and the activations in fp32):
+//   norm     n   = bf16( (x * rsqrt(sum_g(x^2) / hs + eps)) * (1 + w) )         per (row, branch g of hs columns)
+//   down     t   = bf16( n . Wd[k] )            k < lowrank      (F.linear, fp32 accumulation)
+//            a   = bf16( silu(t / hc) )                          (inductor: one rounding)
+//   up       u   = bf16( a . Wu[r] )            r < hc*hs        (F.linear)
+//            mix = bf16( (sum_j sigmoid(u[j*hs+d]) * n[j*hs+d]) / hc )
+//   inject   l   = bf16( n . Wi[j] )            j < hc           (computed with the down rows, used by combine)
+//   combine  g   = bf16( 2 * sigmoid(l / hc) ),  out = bf16( R + bo * g )
+// Kernels (each launch reads the weights once for all M rows):
+//   pre      one work-group per (row, branch): [optional fold of the previous half's combine: R' = combine(R, bo, l),
+//            written as the new residual] + rsqrt of the branch + n (bf16) written          grid M*hc x (hs/8)
+//   down     (16-row block, K split): stages its K slice of n for all M rows in SLM, one sub-group per weight row,
+//            fp32 partial dots -> part[split][m][row]  (Wd rows then Wi rows)               grid ceil(R/16)*KS x 256
+//   up       (UC output columns): sums the KS partials in a fixed order -> a (SLM); every Wu row read once (one
+//            lane per row, or one sub-group per row), u rounded, sigmoid * n, mean over the hc branches -> mix;
+//            work-group 0 also writes l = bf16(sum of the Wi partials)                       grid hs/UC x UC*hc
+//   combine  elementwise R + bo * g (the non-folded combine)
+// No host syncs, no host reads of device data, allocations only through at::empty: XPU-graph capturable.
+//
+// ---------------------------------------------------------------------------------------------------------------
+// Portions derived from Strata:
+//
+// MIT License
+//
+// Copyright (c) 2026 Niko1221 and the Strata contributors
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// ---------------------------------------------------------------------------------------------------------------
+
+#ifndef N114_NO_TORCH          // csrc/cpu_test_hc.cpp includes this file without torch (OpenCL CPU device)
+#include <torch/all.h>
+#include <torch/library.h>
+#include <c10/xpu/XPUStream.h>
+#endif
+#include <sycl/sycl.hpp>
+
+#include <cstdint>
+
+// the reference rounds after every product / sum (no fused multiply-add in R + bo * g, x * r * (1 + w))
+#pragma clang fp contract(off)
+
+namespace n114hc {
+
+constexpr int SG = 16;        // sub-group size
+constexpr int DOWN_WG = 256;  // 16 sub-groups: 16 weight rows per down work-group
+constexpr int MAXM = 8;       // rows per call (Strata kFusedGrMaxT)
+
+struct alignas(16) U4 { uint32_t x[4]; };
+
+static inline float lo_bf(uint32_t w) { return sycl::bit_cast<float>(w << 16); }
+static inline float hi_bf(uint32_t w) { return sycl::bit_cast<float>(w & 0xffff0000u); }
+static inline float bf2f(uint16_t b) { return sycl::bit_cast<float>((uint32_t)b << 16); }
+static inline uint16_t f2bf(float f) {
+    uint32_t u = sycl::bit_cast<uint32_t>(f);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t)((u >> 16) | 0x40u);   // NaN stays NaN
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (uint16_t)(u >> 16);
+}
+static inline float rbf(float f) { return bf2f(f2bf(f)); }   // round to bf16 and back
+static inline float sigm(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }
+
+// 8 bf16 (weights) . 8 bf16 (activations), fp32 accumulation into acc
+static inline float dot8bb(const U4& w, const U4& a, float acc) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        acc = sycl::fma(lo_bf(w.x[j]), lo_bf(a.x[j]), acc);
+        acc = sycl::fma(hi_bf(w.x[j]), hi_bf(a.x[j]), acc);
+    }
+    return acc;
+}
+// 8 bf16 (weights) . 8 floats
+static inline float dot8bf(const U4& w, const float* a, float acc) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        acc = sycl::fma(lo_bf(w.x[j]), a[2 * j], acc);
+        acc = sycl::fma(hi_bf(w.x[j]), a[2 * j + 1], acc);
+    }
+    return acc;
+}
+
+// norm weight element types (the checkpoint stores hc_norm.weight as F16; at runtime it may be fp32, bf16 or fp16)
+struct F16 { uint16_t b; };
+static inline float h2f(uint16_t h) {   // exact IEEE half -> float (subnormals, inf, NaN)
+    const uint32_t s = (uint32_t)(h & 0x8000u) << 16, e = (h >> 10) & 0x1fu, m = h & 0x3ffu;
+    if (e == 0) return sycl::bit_cast<float>(s | 0u) + (s ? -1.0f : 1.0f) * (float)m * 5.9604644775390625e-8f;
+    if (e == 31) return sycl::bit_cast<float>(s | 0x7f800000u | (m << 13));
+    return sycl::bit_cast<float>(s | ((e + 112u) << 23) | (m << 13));
+}
+template <typename WT> static inline float ldw(const WT* p, int64_t i);
+template <> inline float ldw<float>(const float* p, int64_t i) { return p[i]; }
+template <> inline float ldw<uint16_t>(const uint16_t* p, int64_t i) { return bf2f(p[i]); }
+template <> inline float ldw<F16>(const F16* p, int64_t i) { return h2f(p[i].b); }
+
+// ------------------------------------------------------------------------------------------------ pre (norm [+fold])
+struct PreArgs {
+    const uint16_t* x; int64_t xs;        // residual stream rows [M, hc*hs] bf16, row stride (elements)
+    const uint16_t* bo; int64_t bs;       // FOLD: previous block output [M, hs] bf16
+    const float* lprev;                   // FOLD: previous half's l [M, hc] (bf16 values in fp32)
+    uint16_t* rout;                       // FOLD: new residual [M, hc*hs] bf16 contiguous
+    const void* w;                        // norm weight [hc*hs] (fp32 | bf16 | fp16); the kernel uses 1 + w
+    uint16_t* n;                          // normed [M, hc*hs] bf16 contiguous
+    int hs, hc;
+    float eps, inv_hs;
+};
+
+template <bool FOLD, typename WT>
+static void submit_pre(sycl::queue& q, const PreArgs& a, int M) {
+    const int nch = a.hs / 8;
+    const int wg = (nch + SG - 1) / SG * SG;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)M * a.hc * wg), sycl::range<1>(wg)),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            const int g = (int)it.get_group(0);
+            const int m = g / a.hc, j = g - m * a.hc;
+            const int c = (int)it.get_local_id(0);
+            const bool act = c < nch;
+            const int64_t col = (int64_t)j * a.hs + (int64_t)c * 8;
+            float r[8];
+            float ss = 0.0f;
+            if (act) {
+                const U4 xv = *reinterpret_cast<const U4*>(a.x + (int64_t)m * a.xs + col);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) { r[2 * i] = lo_bf(xv.x[i]); r[2 * i + 1] = hi_bf(xv.x[i]); }
+                if constexpr (FOLD) {
+                    const float l = a.lprev[m * a.hc + j] / (float)a.hc;
+                    const float gv = rbf(2.0f * sigm(l));
+                    const U4 bv = *reinterpret_cast<const U4*>(a.bo + (int64_t)m * a.bs + (int64_t)c * 8);
+                    U4 o;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const float p0 = lo_bf(bv.x[i]) * gv, p1 = hi_bf(bv.x[i]) * gv;
+                        const uint16_t b0 = f2bf(r[2 * i] + p0), b1 = f2bf(r[2 * i + 1] + p1);
+                        r[2 * i] = bf2f(b0); r[2 * i + 1] = bf2f(b1);
+                        o.x[i] = (uint32_t)b0 | ((uint32_t)b1 << 16);
+                    }
+                    *reinterpret_cast<U4*>(a.rout + (int64_t)m * a.hc * a.hs + col) = o;
+                }
+#pragma unroll
+                for (int i = 0; i < 8; ++i) ss = sycl::fma(r[i], r[i], ss);
+            }
+            ss = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
+            const float rs = sycl::rsqrt(ss * a.inv_hs + a.eps);
+            if (act) {
+                const WT* w = static_cast<const WT*>(a.w);
+                U4 o;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const float w0 = 1.0f + ldw<WT>(w, col + 2 * i), w1 = 1.0f + ldw<WT>(w, col + 2 * i + 1);
+                    const float y0 = (r[2 * i] * rs) * w0, y1 = (r[2 * i + 1] * rs) * w1;
+                    o.x[i] = (uint32_t)f2bf(y0) | ((uint32_t)f2bf(y1) << 16);
+                }
+                *reinterpret_cast<U4*>(a.n + (int64_t)m * a.hc * a.hs + col) = o;
+            }
+        });
+    });
+}
+
+// ------------------------------------------------------------------------------------------------ down (split-K)
+struct DownArgs {
+    const uint16_t* n;        // [M, D] bf16 contiguous
+    const uint16_t* wd;       // [LR, D] bf16 (row stride D)
+    const uint16_t* wi;       // [nwi, D] bf16 or null
+    float* part;              // [KS][M][R] fp32,  R = LR + nwi
+    int D, LR, R, KS;
+};
+
+template <int MT>
+static void submit_down(sycl::queue& q, const DownArgs& a, int M) {
+    const int kch = a.D / a.KS / 8;              // uint4 chunks per split
+    const int rblocks = (a.R + (DOWN_WG / SG) - 1) / (DOWN_WG / SG);
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<U4, 1> sn(sycl::range<1>((size_t)MT * kch), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)rblocks * a.KS * DOWN_WG), sycl::range<1>(DOWN_WG)),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            const int g = (int)it.get_group(0);
+            const int rb = g / a.KS, s = g - rb * a.KS;
+            const int lid = (int)it.get_local_id(0);
+            const U4* n4 = reinterpret_cast<const U4*>(a.n);
+            const int dch = a.D / 8;
+            for (int i = lid; i < M * kch; i += DOWN_WG) {
+                const int m = i / kch, c = i - m * kch;
+                sn[i] = n4[(int64_t)m * dch + (int64_t)s * kch + c];
+            }
+            sycl::group_barrier(it.get_group());
+            auto sg = it.get_sub_group();
+            const int lane = (int)sg.get_local_id()[0];
+            const int row = rb * (DOWN_WG / SG) + (int)sg.get_group_id()[0];
+            if (row >= a.R) return;   // uniform over the sub-group; no barrier follows
+            const uint16_t* wrow = row < a.LR ? a.wd + (int64_t)row * a.D : a.wi + (int64_t)(row - a.LR) * a.D;
+            const U4* w4 = reinterpret_cast<const U4*>(wrow) + (int64_t)s * kch;
+            float acc[MT];
+#pragma unroll
+            for (int m = 0; m < MT; ++m) acc[m] = 0.0f;
+#pragma unroll 4
+            for (int c = lane; c < kch; c += SG) {
+                const U4 w = w4[c];
+#pragma unroll
+                for (int m = 0; m < MT; ++m)
+                    if (m < M) acc[m] = dot8bb(w, sn[m * kch + c], acc[m]);
+            }
+#pragma unroll
+            for (int m = 0; m < MT; ++m) {
+                if (m < M) {
+                    const float v = sycl::reduce_over_group(sg, acc[m], sycl::plus<float>());
+                    if (lane == 0) a.part[((int64_t)s * M + m) * a.R + row] = v;
+                }
+            }
+        });
+    });
+}
+
+// ------------------------------------------------------------------------------------------------ up (+ epilogue)
+struct UpArgs {
+    const float* part;        // [KS][M][R]
+    const uint16_t* wu;       // [hc*hs, LR] bf16 (row stride LR)
+    const uint16_t* n;        // [M, D] bf16 contiguous
+    uint16_t* mix; int64_t ms;// [M, hs] bf16, row stride
+    float* lout;              // [M, hc] or null (bf16 values in fp32)
+    int D, LR, R, KS, hs, hc;
+};
+
+// MODE 0: one lane per Wu row (the sub-group reads 16 consecutive rows); MODE 1: one sub-group per row
+template <int MT, int MODE>
+static void submit_up(sycl::queue& q, const UpArgs& a, int M, int uc) {
+    const int wg = uc * a.hc;
+    const int lch = a.LR / 8;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> sa(sycl::range<1>((size_t)MT * a.LR), h);
+        sycl::local_accessor<float, 1> sgm(sycl::range<1>((size_t)MT * wg), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)(a.hs / uc) * wg), sycl::range<1>(wg)),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            const int g = (int)it.get_group(0);
+            const int lid = (int)it.get_local_id(0);
+            const float inv_hc = 1.0f / (float)a.hc;
+            for (int i = lid; i < M * a.LR; i += wg) {
+                const int m = i / a.LR, k = i - m * a.LR;
+                float t = 0.0f;
+                for (int s = 0; s < a.KS; ++s) t += a.part[((int64_t)s * M + m) * a.R + k];
+                const float x = rbf(t) / (float)a.hc;
+                sa[i] = rbf(x * sigm(x));
+            }
+            if (g == 0 && a.lout != nullptr) {
+                for (int i = lid; i < M * a.hc; i += wg) {
+                    const int m = i / a.hc, j = i - m * a.hc;
+                    float t = 0.0f;
+                    for (int s = 0; s < a.KS; ++s) t += a.part[((int64_t)s * M + m) * a.R + a.LR + j];
+                    a.lout[i] = rbf(t);
+                }
+            }
+            sycl::group_barrier(it.get_group());
+            const int d0 = g * uc;
+            if constexpr (MODE == 0) {
+                const int j = lid / uc, dd = lid - j * uc;
+                const int64_t row = (int64_t)j * a.hs + d0 + dd;
+                const U4* w4 = reinterpret_cast<const U4*>(a.wu + row * a.LR);
+                float acc[MT];
+#pragma unroll
+                for (int m = 0; m < MT; ++m) acc[m] = 0.0f;
+#pragma unroll 8
+                for (int c = 0; c < lch; ++c) {
+                    const U4 w = w4[c];
+#pragma unroll
+                    for (int m = 0; m < MT; ++m) {
+                        if (m < M) {
+                            float av[8];
+#pragma unroll
+                            for (int e = 0; e < 8; ++e) av[e] = sa[m * a.LR + c * 8 + e];
+                            acc[m] = dot8bf(w, av, acc[m]);
+                        }
+                    }
+                }
+#pragma unroll
+                for (int m = 0; m < MT; ++m) {
+                    if (m < M) {
+                        const float u = rbf(acc[m]);
+                        const float nv = bf2f(a.n[(int64_t)m * a.D + row]);
+                        sgm[m * wg + j * uc + dd] = sigm(u) * nv;
+                    }
+                }
+            } else {
+                auto sg = it.get_sub_group();
+                const int lane = (int)sg.get_local_id()[0];
+                const int nsg = wg / SG;
+                for (int r = (int)sg.get_group_id()[0]; r < wg; r += nsg) {
+                    const int j = r / uc, dd = r - j * uc;
+                    const int64_t row = (int64_t)j * a.hs + d0 + dd;
+                    const U4* w4 = reinterpret_cast<const U4*>(a.wu + row * a.LR);
+                    float acc[MT];
+#pragma unroll
+                    for (int m = 0; m < MT; ++m) acc[m] = 0.0f;
+                    for (int c = lane; c < lch; c += SG) {
+                        const U4 w = w4[c];
+#pragma unroll
+                        for (int m = 0; m < MT; ++m) {
+                            if (m < M) {
+                                float av[8];
+#pragma unroll
+                                for (int e = 0; e < 8; ++e) av[e] = sa[m * a.LR + c * 8 + e];
+                                acc[m] = dot8bf(w, av, acc[m]);
+                            }
+                        }
+                    }
+#pragma unroll
+                    for (int m = 0; m < MT; ++m) {
+                        if (m < M) {
+                            const float v = sycl::reduce_over_group(sg, acc[m], sycl::plus<float>());
+                            if (lane == 0) {
+                                const float u = rbf(v);
+                                const float nv = bf2f(a.n[(int64_t)m * a.D + row]);
+                                sgm[m * wg + j * uc + dd] = sigm(u) * nv;
+                            }
+                        }
+                    }
+                }
+            }
+            sycl::group_barrier(it.get_group());
+            for (int i = lid; i < M * uc; i += wg) {
+                const int m = i / uc, dd = i - m * uc;
+                float s = 0.0f;
+                for (int j = 0; j < a.hc; ++j) s += sgm[m * wg + j * uc + dd];
+                a.mix[(int64_t)m * a.ms + d0 + dd] = f2bf(s * inv_hc);
+            }
+        });
+    });
+}
+
+// ------------------------------------------------------------------------------------------------ combine
+struct CombArgs {
+    const uint16_t* r; int64_t rs;     // [M, hc*hs] bf16
+    const uint16_t* bo; int64_t bs;    // [M, hs] bf16
+    const float* l;                    // [M, hc] (bf16 values in fp32)
+    uint16_t* out;                     // [M, hc*hs] bf16 contiguous
+    int hs, hc;
+};
+
+static void submit_combine(sycl::queue& q, const CombArgs& a, int M) {
+    const int64_t nch = (int64_t)a.hc * a.hs / 8;
+    const int64_t tot = (int64_t)M * nch;
+    const int64_t wg = 256;
+    const int64_t glob = (tot + wg - 1) / wg * wg;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)glob), sycl::range<1>((size_t)wg)),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            const int64_t i = (int64_t)it.get_global_id(0);
+            if (i >= tot) return;
+            const int64_t m = i / nch, c = i - m * nch;
+            const int64_t col = c * 8;
+            const int j = (int)(col / a.hs);
+            const int64_t d = col - (int64_t)j * a.hs;
+            const float gv = rbf(2.0f * sigm(a.l[m * a.hc + j] / (float)a.hc));
+            const U4 rv = *reinterpret_cast<const U4*>(a.r + m * a.rs + col);
+            const U4 bv = *reinterpret_cast<const U4*>(a.bo + m * a.bs + d);
+            U4 o;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const float p0 = lo_bf(bv.x[k]) * gv, p1 = hi_bf(bv.x[k]) * gv;
+                o.x[k] = (uint32_t)f2bf(lo_bf(rv.x[k]) + p0) | ((uint32_t)f2bf(hi_bf(rv.x[k]) + p1) << 16);
+            }
+            *reinterpret_cast<U4*>(a.out + m * a.hc * a.hs + col) = o;
+        });
+    });
+}
+
+// ------------------------------------------------------------------------------------------------ dispatch helpers
+// wdt: norm weight dtype code 0 = fp32, 1 = bf16, 2 = fp16
+template <bool FOLD>
+static void pre_dispatch(sycl::queue& q, const PreArgs& a, int M, int wdt) {
+    if (wdt == 0) submit_pre<FOLD, float>(q, a, M);
+    else if (wdt == 2) submit_pre<FOLD, F16>(q, a, M);
+    else submit_pre<FOLD, uint16_t>(q, a, M);
+}
+
+static void down_dispatch(sycl::queue& q, const DownArgs& a, int M) {
+    if (M <= 1) submit_down<1>(q, a, M);
+    else if (M <= 2) submit_down<2>(q, a, M);
+    else if (M <= 4) submit_down<4>(q, a, M);
+    else submit_down<8>(q, a, M);
+}
+
+template <int MODE>
+static void up_dispatch_m(sycl::queue& q, const UpArgs& a, int M, int uc) {
+    if (M <= 1) submit_up<1, MODE>(q, a, M, uc);
+    else if (M <= 2) submit_up<2, MODE>(q, a, M, uc);
+    else if (M <= 4) submit_up<4, MODE>(q, a, M, uc);
+    else submit_up<8, MODE>(q, a, M, uc);
+}
+
+static void up_dispatch(sycl::queue& q, const UpArgs& a, int M, int uc, int mode) {
+    if (mode == 1) up_dispatch_m<1>(q, a, M, uc);
+    else up_dispatch_m<0>(q, a, M, uc);
+}
+
+// full mix: [fold] pre -> down -> up. Pointers must satisfy the checks of the torch wrapper (or the CPU test).
+struct MixPlan {
+    int M, hs, hc, LR, KS, UC, MODE;
+    bool fold;
+    int wdt;            // norm weight dtype code: 0 fp32, 1 bf16, 2 fp16
+    float eps;
+};
+
+static void run_mix(sycl::queue& q, const MixPlan& p, const uint16_t* x, int64_t xs, const uint16_t* bo, int64_t bs,
+                    const float* lprev, uint16_t* rout, const void* w, const uint16_t* wd, const uint16_t* wu,
+                    const uint16_t* wi, int nwi, uint16_t* n, float* part, uint16_t* mix, int64_t ms, float* lout) {
+    const int D = p.hc * p.hs;
+    PreArgs pa{x, xs, bo, bs, lprev, rout, w, n, p.hs, p.hc, p.eps, 1.0f / (float)p.hs};
+    if (p.fold) pre_dispatch<true>(q, pa, p.M, p.wdt);
+    else pre_dispatch<false>(q, pa, p.M, p.wdt);
+    DownArgs da{n, wd, wi, part, D, p.LR, p.LR + nwi, p.KS};
+    down_dispatch(q, da, p.M);
+    UpArgs ua{part, wu, n, mix, ms, nwi > 0 ? lout : nullptr, D, p.LR, p.LR + nwi, p.KS, p.hs, p.hc};
+    up_dispatch(q, ua, p.M, p.UC, p.MODE);
+}
+
+// shape rules shared by the torch wrapper and the CPU test (down SLM: MT rows x one K split of n, <= 64 KB)
+static inline int mt_of(int M) { return M <= 1 ? 1 : M <= 2 ? 2 : M <= 4 ? 4 : 8; }
+static inline bool plan_ok(int M, int hs, int hc, int LR, int KS, int UC) {
+    const int D = hc * hs;
+    return M >= 1 && M <= MAXM && hc >= 1 && hc <= 8 && hs % 8 == 0 && hs / 8 <= 1024 && LR % 8 == 0 &&
+           LR >= 8 && LR <= 1024 && KS >= 1 && D % (KS * 8) == 0 && (UC == 8 || UC == 16 || UC == 32 || UC == 64) &&
+           hs % UC == 0 && UC * hc % SG == 0 && UC * hc <= 1024 && (int64_t)mt_of(M) * (D / KS / 8) * 16 <= 64 * 1024;
+}
+
+#ifndef N114_NO_TORCH
+static sycl::queue& queue_of(const at::Tensor& t) { return c10::xpu::getCurrentXPUStream(t.device().index()).queue(); }
+
+static void chk_rows(const at::Tensor& t, const char* name, int64_t M, int64_t cols) {
+    TORCH_CHECK(t.is_xpu() && t.scalar_type() == at::kBFloat16 && t.dim() == 2 && t.size(0) == M && t.size(1) == cols &&
+                t.stride(1) == 1 && t.stride(0) % 8 == 0 && reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
+                "n114hc: ", name, " must be a 16-byte aligned bf16 [", M, ", ", cols, "] xpu tensor with unit inner stride");
+}
+static void chk_w(const at::Tensor& t, const char* name, int64_t rows, int64_t cols) {
+    TORCH_CHECK(t.is_xpu() && t.scalar_type() == at::kBFloat16 && t.dim() == 2 && t.size(0) == rows &&
+                t.size(1) == cols && t.is_contiguous() && reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
+                "n114hc: ", name, " must be a contiguous 16-byte aligned bf16 [", rows, ", ", cols, "] xpu tensor");
+}
+
+// shared body of mix / combine_mix. Returns (mixed [M, hs], n [M, D], l [M, hc] fp32 (empty without wi)).
+static std::tuple<at::Tensor, at::Tensor, at::Tensor> mix_impl(
+        const at::Tensor& x, const c10::optional<at::Tensor>& bo, const c10::optional<at::Tensor>& lprev,
+        at::Tensor* rout, const at::Tensor& norm_w, const at::Tensor& wd, const at::Tensor& wu,
+        const c10::optional<at::Tensor>& wi, double eps, int64_t hc, int64_t ks, int64_t uc, int64_t mode) {
+    TORCH_CHECK(x.dim() == 2 && hc > 0 && x.size(1) % hc == 0, "n114hc: x [M, hc*hs]");
+    const int64_t M = x.size(0), D = x.size(1), hs = D / hc, LR = wd.size(0);
+    TORCH_CHECK(plan_ok((int)M, (int)hs, (int)hc, (int)LR, (int)ks, (int)uc), "n114hc: unsupported shape/config M=", M,
+                " hs=", hs, " hc=", hc, " lowrank=", LR, " ks=", ks, " uc=", uc);
+    chk_rows(x, "x", M, D);
+    chk_w(wd, "w_down", LR, D);
+    chk_w(wu, "w_up", D, LR);
+    const bool has_wi = wi.has_value() && wi->defined() && wi->numel() > 0;
+    if (has_wi) chk_w(*wi, "w_inject", hc, D);
+    TORCH_CHECK(norm_w.is_xpu() && norm_w.dim() == 1 && norm_w.size(0) == D && norm_w.is_contiguous() &&
+                (norm_w.scalar_type() == at::kFloat || norm_w.scalar_type() == at::kBFloat16 ||
+                 norm_w.scalar_type() == at::kHalf), "n114hc: norm weight [D] fp32|bf16|fp16");
+    const bool fold = rout != nullptr;
+    if (fold) {
+        TORCH_CHECK(bo.has_value() && lprev.has_value(), "n114hc: fold needs bo and l");
+        chk_rows(*bo, "bo", M, hs);
+        TORCH_CHECK(lprev->is_xpu() && lprev->scalar_type() == at::kFloat && lprev->is_contiguous() &&
+                    lprev->numel() == M * hc, "n114hc: l [M, hc] fp32 contiguous");
+    }
+    auto opt = x.options();
+    auto n = at::empty({M, D}, opt);
+    auto mixed = at::empty({M, hs}, opt);
+    auto part = at::empty({ks, M, LR + (has_wi ? hc : 0)}, opt.dtype(at::kFloat));
+    auto l = has_wi ? at::empty({M, hc}, opt.dtype(at::kFloat)) : at::empty({0}, opt.dtype(at::kFloat));
+    if (fold) *rout = at::empty({M, D}, opt);
+    const int wdt = norm_w.scalar_type() == at::kFloat ? 0 : norm_w.scalar_type() == at::kHalf ? 2 : 1;
+    MixPlan p{(int)M, (int)hs, (int)hc, (int)LR, (int)ks, (int)uc, (int)mode, fold, wdt, (float)eps};
+    auto& q = queue_of(x);
+    run_mix(q, p, reinterpret_cast<const uint16_t*>(x.data_ptr()), x.stride(0),
+            fold ? reinterpret_cast<const uint16_t*>(bo->data_ptr()) : nullptr, fold ? bo->stride(0) : 0,
+            fold ? lprev->data_ptr<float>() : nullptr, fold ? reinterpret_cast<uint16_t*>(rout->data_ptr()) : nullptr,
+            norm_w.data_ptr(), reinterpret_cast<const uint16_t*>(wd.data_ptr()),
+            reinterpret_cast<const uint16_t*>(wu.data_ptr()),
+            has_wi ? reinterpret_cast<const uint16_t*>(wi->data_ptr()) : nullptr, has_wi ? (int)hc : 0,
+            reinterpret_cast<uint16_t*>(n.data_ptr()), part.data_ptr<float>(),
+            reinterpret_cast<uint16_t*>(mixed.data_ptr()), mixed.stride(0), has_wi ? l.data_ptr<float>() : nullptr);
+    return {mixed, n, l};
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_mix(at::Tensor x, at::Tensor norm_w, at::Tensor wd, at::Tensor wu,
+                                                      c10::optional<at::Tensor> wi, double eps, int64_t hc, int64_t ks,
+                                                      int64_t uc, int64_t mode) {
+    return mix_impl(x, c10::nullopt, c10::nullopt, nullptr, norm_w, wd, wu, wi, eps, hc, ks, uc, mode);
+}
+
+// fold: r_new = combine(r, bo, l_prev) (the previous half's write), then mix(r_new).
+// Returns (mixed, r_new, n, l).
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> hc_combine_mix(
+        at::Tensor r, at::Tensor bo, at::Tensor lprev, at::Tensor norm_w, at::Tensor wd, at::Tensor wu,
+        c10::optional<at::Tensor> wi, double eps, int64_t hc, int64_t ks, int64_t uc, int64_t mode) {
+    at::Tensor rout;
+    auto res = mix_impl(r, bo, lprev, &rout, norm_w, wd, wu, wi, eps, hc, ks, uc, mode);
+    return {std::get<0>(res), rout, std::get<1>(res), std::get<2>(res)};
+}
+
+at::Tensor hc_combine(at::Tensor r, at::Tensor bo, at::Tensor l, int64_t hc) {
+    TORCH_CHECK(r.dim() == 2 && hc > 0 && r.size(1) % hc == 0, "n114hc.combine: r [M, hc*hs]");
+    const int64_t M = r.size(0), D = r.size(1), hs = D / hc;
+    TORCH_CHECK(hs % 8 == 0, "n114hc.combine: hs % 8");
+    chk_rows(r, "r", M, D);
+    chk_rows(bo, "bo", M, hs);
+    TORCH_CHECK(l.is_xpu() && l.scalar_type() == at::kFloat && l.is_contiguous() && l.numel() == M * hc,
+                "n114hc.combine: l [M, hc] fp32 contiguous");
+    auto out = at::empty({M, D}, r.options());
+    if (M == 0) return out;
+    CombArgs a{reinterpret_cast<const uint16_t*>(r.data_ptr()), r.stride(0),
+               reinterpret_cast<const uint16_t*>(bo.data_ptr()), bo.stride(0), l.data_ptr<float>(),
+               reinterpret_cast<uint16_t*>(out.data_ptr()), (int)hs, (int)hc};
+    submit_combine(queue_of(r), a, (int)M);
+    return out;
+}
+#endif  // N114_NO_TORCH
+}  // namespace n114hc
+
+#ifndef N114_NO_TORCH
+TORCH_LIBRARY(n114hc, m) {
+    m.def("mix(Tensor x, Tensor norm_w, Tensor wd, Tensor wu, Tensor? wi, float eps, int hc, int ks, int uc, int mode)"
+          " -> (Tensor, Tensor, Tensor)");
+    m.def("combine_mix(Tensor r, Tensor bo, Tensor l, Tensor norm_w, Tensor wd, Tensor wu, Tensor? wi, float eps, "
+          "int hc, int ks, int uc, int mode) -> (Tensor, Tensor, Tensor, Tensor)");
+    m.def("combine(Tensor r, Tensor bo, Tensor l, int hc) -> Tensor");
+    m.impl("mix", torch::kXPU, &n114hc::hc_mix);
+    m.impl("combine_mix", torch::kXPU, &n114hc::hc_combine_mix);
+    m.impl("combine", torch::kXPU, &n114hc::hc_combine);
+}
+#endif

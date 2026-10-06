@@ -1,0 +1,811 @@
+#include <map>
+// Host launchers + torch bindings for EXL3 ESIMD kernels.
+#include <torch/all.h>
+#include <torch/library.h>
+#include <c10/xpu/XPUStream.h>
+#include "exl3_esimd.h"
+#include "fa_esimd.h"
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+
+using namespace exl3;
+
+static sycl::queue& queue_of(const at::Tensor& t) {
+    return c10::xpu::getCurrentXPUStream(t.device().index()).queue();
+}
+
+static int round_up(int a, int b) { return (a + b - 1) / b * b; }
+// MB=64 DPAS: two tiles per thread in 256-register mode (M=64 linears 120 -> 87 ms on B70)
+#ifndef EXL3_NO_DPAS64_LARGE_GRF
+#define EXL3_DPAS64_LARGE_GRF
+#endif
+#ifndef EXL3_DPAS64_NT
+#define EXL3_DPAS64_NT 2
+#endif
+static int g_local = 8;       // work-group size (threads) for the GEMV / DPAS launches
+// MB=24 DPAS block for 17..24 rows (3 x 8-row DPAS, 2 tiles/thread): all linears M=17 43.3 -> 41.1 ms,
+// M=24 45.0 -> 42.6 (NT=4 spills: ~110 ms). Opt out with EXL3_NO_DPAS_MB24.
+#ifndef EXL3_NO_DPAS_MB24
+#define EXL3_DPAS_MB24
+#endif
+// MB=40/48 blocks (256-GRF, NT=2, split-K target as MB=64) for 33..48 rows (C16 thinking-on runs ~10 streams =
+// ~40 rows): all linears M=33 59.7 -> 56.9, M=40 61.9 -> 58.5, M=48 64.3 -> 61.6 ms. Opt out: EXL3_NO_DPAS_MB48.
+#ifndef EXL3_NO_DPAS_MB48
+#define EXL3_DPAS_MB48
+#endif
+static int g_max_mb = 64;     // largest DPAS row block; M above it runs as several blocks
+void exl3_set_max_mb(int64_t n) { g_max_mb = (int)n; }
+void exl3_set_local(int64_t n) { g_local = (int)n; }
+
+template <typename TIn>
+static void launch_had_in(const at::Tensor& x, const at::Tensor& suh, at::Tensor& xh, sycl::queue& q,
+                          bool row_major = false) {
+    int M = x.size(0), Kdim = x.size(1), S = suh.size(0), Mp = xh.size(1);
+    int n = S * M * (Kdim / 128);
+    HadInKernel<TIn> k{reinterpret_cast<const TIn*>(x.data_ptr()), reinterpret_cast<const fp16*>(suh.data_ptr()),
+                       reinterpret_cast<fp16*>(xh.data_ptr()), M, Kdim, S, (int)x.stride(0), Mp, row_major ? 1 : 0};
+    int local = 8;
+    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(round_up(n, local), local), k); });
+}
+
+template <typename TOut, typename TPart = float>
+static void launch_had_out(const at::Tensor& part, int P, const at::Tensor& svh, at::Tensor& out, sycl::queue& q) {
+    int M = out.size(0), N = out.size(1);
+    int n = M * (N / 128);
+    HadOutKernel<TOut, TPart> k{reinterpret_cast<const TPart*>(part.data_ptr()), reinterpret_cast<const fp16*>(svh.data_ptr()),
+                         reinterpret_cast<TOut*>(out.data_ptr()), M, N, P, (int)out.stride(0)};
+    int local = 8;
+    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(round_up(n, local), local), k); });
+}
+
+#ifdef EXL3_LUT
+// one table per (device, codebook), built on first use from decode_cb_h itself (bit-exact by construction)
+static const fp16* lut_for(int cb, const at::Tensor& like, sycl::queue& q) {
+    static std::map<std::pair<int, int>, at::Tensor> tabs;
+    auto key = std::make_pair((int)like.device().index(), cb);
+    auto it = tabs.find(key);
+    if (it == tabs.end()) {
+        auto t = at::empty({65536}, like.options().dtype(at::kHalf));
+        fp16* p = reinterpret_cast<fp16*>(t.data_ptr());
+        q.submit([&](sycl::handler& h) {
+            if (cb == 1) h.parallel_for(sycl::nd_range<1>(4096, 16), LutKernel<1>{p});
+            else if (cb == 2) h.parallel_for(sycl::nd_range<1>(4096, 16), LutKernel<2>{p});
+            else h.parallel_for(sycl::nd_range<1>(4096, 16), LutKernel<0>{p});
+        });
+        q.wait();
+        it = tabs.emplace(key, t).first;
+    }
+    return reinterpret_cast<const fp16*>(it->second.data_ptr());
+}
+#endif
+
+template <int K, int CB, int MR, int NT>
+static void launch_gemv(const at::Tensor& xh, const at::Tensor& tr, const at::Tensor& shard, at::Tensor& part,
+                        int M, int Kdim, int N, int P, int rows_per_split, sycl::queue& q) {
+    int tiles_n = N / 16;
+    int n_strips = tiles_n / NT;
+    GemvKernel<K, CB, MR, NT> k{reinterpret_cast<const fp16*>(xh.data_ptr()),
+                                reinterpret_cast<const uint32_t*>(tr.data_ptr()),
+                                shard.data_ptr<int>(), part.data_ptr<float>(),
+                                M, Kdim, N, tiles_n, rows_per_split, n_strips};
+#ifdef EXL3_LUT
+    k.lut = lut_for(CB, xh, q);
+#endif
+    int n = n_strips * P;
+    int local = g_local;
+    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(round_up(n, local), local), k); });
+}
+
+template <int K, int CB, int MB, int NT>
+static void launch_dpas(const at::Tensor& xh, const at::Tensor& tr, const at::Tensor& shard, at::Tensor& part,
+                        int M, int Kdim, int N, int P, int rows_per_split, sycl::queue& q) {
+    int tiles_n = N / 16;
+    int n_strips = tiles_n / NT;
+    int m_blocks = (M + MB - 1) / MB;
+    TORCH_CHECK(xh.size(-2) == m_blocks * MB || (xh.dim() == 4 && xh.size(2) == m_blocks * MB), "xh rows must be padded to MB");
+    DpasKernel<K, CB, MB, NT> k{reinterpret_cast<const fp16*>(xh.data_ptr()),
+                                reinterpret_cast<const uint32_t*>(tr.data_ptr()),
+                                shard.data_ptr<int>(), part.data_ptr<float>(),
+                                M, Kdim, N, tiles_n, rows_per_split, n_strips, m_blocks, m_blocks * MB};
+    int n = n_strips * m_blocks * P;
+    int local = g_local;
+#if defined(EXL3_DPAS_LARGE_GRF) || defined(EXL3_DPAS64_LARGE_GRF)
+#ifdef EXL3_DPAS_LARGE_GRF
+    constexpr bool large = true;
+#elif defined(EXL3_DPAS32_LARGE_GRF)
+    constexpr bool large = (MB >= 32);
+#else
+    constexpr bool large = (MB >= 40);
+#endif
+    if constexpr (large) {
+        // 256-register mode: room for the MB x 16 x NT accumulator without spills
+        sycl::ext::oneapi::experimental::properties props{sycl::ext::intel::experimental::grf_size<256>};
+        q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(round_up(n, local), local), props, k); });
+    } else {
+        q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(round_up(n, local), local), k); });
+    }
+#else
+    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(round_up(n, local), local), k); });
+#endif
+}
+
+template <int K, int CB>
+static bool dispatch_dpas(int MB, const at::Tensor& xh, const at::Tensor& tr, const at::Tensor& shard,
+                          at::Tensor& part, int M, int Kdim, int N, int P, int rps, sycl::queue& q) {
+    switch (MB) {
+#ifndef EXL3_DPAS8_NT
+#define EXL3_DPAS8_NT 4
+#endif
+#ifndef EXL3_DPAS4_NT
+#define EXL3_DPAS4_NT 4
+#endif
+#ifdef EXL3_DPAS_MB4
+        case 4:  launch_dpas<K, CB, 4, EXL3_DPAS4_NT>(xh, tr, shard, part, M, Kdim, N, P, rps, q); return true;
+#endif
+        case 8:  launch_dpas<K, CB, 8, EXL3_DPAS8_NT>(xh, tr, shard, part, M, Kdim, N, P, rps, q); return true;
+        case 16: launch_dpas<K, CB, 16, 4>(xh, tr, shard, part, M, Kdim, N, P, rps, q); return true;
+#ifdef EXL3_DPAS_MB24
+#ifndef EXL3_DPAS24_NT
+#define EXL3_DPAS24_NT 2
+#endif
+        case 24: launch_dpas<K, CB, 24, EXL3_DPAS24_NT>(xh, tr, shard, part, M, Kdim, N, P, rps, q); return true;
+#endif
+#ifndef EXL3_DPAS32_NT
+#define EXL3_DPAS32_NT 2
+#endif
+        case 32: launch_dpas<K, CB, 32, EXL3_DPAS32_NT>(xh, tr, shard, part, M, Kdim, N, P, rps, q); return true;
+#ifdef EXL3_DPAS_MB48
+        case 40: launch_dpas<K, CB, 40, 2>(xh, tr, shard, part, M, Kdim, N, P, rps, q); return true;
+        case 48: launch_dpas<K, CB, 48, 2>(xh, tr, shard, part, M, Kdim, N, P, rps, q); return true;
+#endif
+#ifndef EXL3_DPAS64_NT
+#define EXL3_DPAS64_NT 1
+#endif
+        case 64: launch_dpas<K, CB, 64, EXL3_DPAS64_NT>(xh, tr, shard, part, M, Kdim, N, P, rps, q); return true;
+    }
+    return false;
+}
+
+#ifndef EXL3_DPAS24_NT
+#define EXL3_DPAS24_NT 2
+#endif
+static int dpas_nt(int MB) { return MB == 4 ? EXL3_DPAS4_NT : MB == 8 ? EXL3_DPAS8_NT : MB == 24 ? EXL3_DPAS24_NT : (MB == 40 || MB == 48) ? 2 : (MB <= 16 ? 4 : (MB == 32 ? EXL3_DPAS32_NT : EXL3_DPAS64_NT)); }
+static int g_vec_max_m = 2;   // vector kernel for M<=2, DPAS (flat cost up to M=8) above
+
+// Split-K sizing: threads to aim for when choosing the number of K splits. Measured on B70 (all linears,
+// graph-captured): 1024 beats 4096 by 10-20% for M=1..32 (fewer fp32 partials for had_out to reduce, and the
+// 256-GRF DPAS kernels only hold ~1024 resident threads); MB=64 prefers 2048 (77 vs 88 ms).
+static int g_target_threads = 1024;          // vector GEMV (M<=2) and DPAS MB=32
+static int g_target_threads_mb16 = 1408;     // DPAS MB=8/16: plateau 1280-1536 (M=4 35.1->32.2 ms, M=16 38.7->36.0), cliff at 1664
+static int g_target_threads_mb64 = 2048;
+
+// Column-strip width (tiles per thread) per case, from bench sweeps on B70:
+// K=4 M=1 -> 8 (longer contiguous reads), K=4 M=2..4 -> 4, K=6 -> 4 (two 32-lane tile pairs), M=8 -> 2.
+// K=3/5 (gcd(K,32)=1): 8 lanes per tile, GemvKernel pairs 4 tiles per vector op -> NT >= 4.
+constexpr int tp_of(int K) { return (256 / (32 / cgcd(K, 32))) >= 32 ? 1 : 32 / (256 / (32 / cgcd(K, 32))); }
+constexpr int nt_raw(int K, int MR) { return MR == 8 ? 2 : (K <= 4 ? (MR == 1 ? 8 : 4) : 4); }
+constexpr int nt_of(int K, int MR) { return nt_raw(K, MR) < tp_of(K) ? tp_of(K) : nt_raw(K, MR); }
+static int nt_for(int K, int MR) { return nt_of(K, MR); }
+
+template <int K, int CB>
+static bool dispatch_mr(int MR, const at::Tensor& xh, const at::Tensor& tr, const at::Tensor& shard,
+                        at::Tensor& part, int M, int Kdim, int N, int P, int rps, sycl::queue& q) {
+    switch (MR) {
+        case 1: launch_gemv<K, CB, 1, nt_of(K, 1)>(xh, tr, shard, part, M, Kdim, N, P, rps, q); return true;
+        case 2: launch_gemv<K, CB, 2, nt_of(K, 2)>(xh, tr, shard, part, M, Kdim, N, P, rps, q); return true;
+        case 4: launch_gemv<K, CB, 4, nt_of(K, 4)>(xh, tr, shard, part, M, Kdim, N, P, rps, q); return true;
+        case 8: launch_gemv<K, CB, 8, nt_of(K, 8)>(xh, tr, shard, part, M, Kdim, N, P, rps, q); return true;
+    }
+    return false;
+}
+
+// ---- fused single-kernel path (M <= 8, fp16 in/out): input Hadamard + GEMM + split-K + output Hadamard
+static at::Tensor& fused_counters(const at::Device& dev) {
+    static std::vector<at::Tensor> bufs(16);
+    auto& b = bufs.at(dev.index());
+    if (!b.defined()) b = at::zeros({1 << 16}, at::TensorOptions().dtype(at::kInt).device(dev));
+    return b;
+}
+
+template <typename KernelT>
+static void launch_fused(KernelT k, int n, sycl::queue& q) {
+    int local = 8;
+    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(round_up(n, local), local), k); });
+}
+
+template <int K, int CB>
+static bool fused_small(const at::Tensor& x, const at::Tensor& tr, const at::Tensor& suh, const at::Tensor& svh,
+                        const at::Tensor& shard, at::Tensor& out, int M, int Kdim, int N, sycl::queue& q) {
+    int tk = Kdim / 16, tiles_n = N / 16;
+    bool vec = M <= g_vec_max_m;
+    int NT = vec ? (M <= 1 ? nt_of(K, 1) : nt_of(K, 2)) : dpas_nt(8);
+    int n_strips = tiles_n / NT;
+    int P = std::max(1, std::min(tk / 8, (g_target_threads + n_strips - 1) / n_strips));
+    int rps = ((tk + P - 1) / P + 7) / 8 * 8;             // multiple of 8 tile-rows (one Hadamard block)
+    P = (tk + rps - 1) / rps;
+    auto part = at::empty({P, M, N}, x.options().dtype(at::kFloat));
+    FusedArgs fa{reinterpret_cast<const fp16*>(x.data_ptr()), (int)x.stride(0),
+                 reinterpret_cast<const fp16*>(suh.data_ptr()), reinterpret_cast<const fp16*>(svh.data_ptr()),
+                 reinterpret_cast<fp16*>(out.data_ptr()), (int)out.stride(0),
+                 reinterpret_cast<uint32_t*>(fused_counters(x.device()).data_ptr())};
+    const uint32_t* trp = reinterpret_cast<const uint32_t*>(tr.data_ptr());
+    const int* shp = shard.data_ptr<int>();
+    float* pp = part.data_ptr<float>();
+    int n = n_strips * P;
+    if (vec) {
+        if (M <= 1) {
+            GemvKernel<K, CB, 1, nt_of(K, 1), true> k{nullptr, trp, shp, pp, M, Kdim, N, tiles_n, rps, n_strips, fa, P};
+#ifdef EXL3_LUT
+            k.lut = lut_for(CB, x, q);
+#endif
+            launch_fused(k, n, q);
+        } else {
+            GemvKernel<K, CB, 2, nt_of(K, 2), true> k{nullptr, trp, shp, pp, M, Kdim, N, tiles_n, rps, n_strips, fa, P};
+#ifdef EXL3_LUT
+            k.lut = lut_for(CB, x, q);
+#endif
+            launch_fused(k, n, q);
+        }
+    } else {
+        DpasKernel<K, CB, 8, EXL3_DPAS8_NT, true> k{nullptr, trp, shp, pp, M, Kdim, N, tiles_n, rps, n_strips, 1, 8, fa, P};
+        launch_fused(k, n, q);
+    }
+    return true;
+}
+
+static bool g_fused = false;   // measured slower under XPU graphs (serialized split-K tail); opt in via exl3_set_fused
+void exl3_set_fused(int64_t on) { g_fused = on != 0; }
+
+void exl3_gemm_small(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Tensor svh, at::Tensor shard_of_nb,
+                     at::Tensor out, int64_t K, int64_t cb) {
+    TORCH_CHECK(x.dim() == 2 && x.stride(1) == 1, "x must be 2D row-major");
+    TORCH_CHECK(trellis.scalar_type() == at::kShort && trellis.is_contiguous());
+    auto& q = queue_of(x);
+    int M = x.size(0), Kdim = x.size(1), N = svh.size(0), S = suh.size(0);
+    if (g_fused && M <= 8 && x.scalar_type() == at::kHalf && out.scalar_type() == at::kHalf && out.stride(1) == 1 &&
+        N / 128 <= (1 << 16)) {
+        bool done = false;
+        if (K == 4 && cb == 2) done = fused_small<4, 2>(x, trellis, suh, svh, shard_of_nb, out, M, Kdim, N, q);
+        else if (K == 6 && cb == 2) done = fused_small<6, 2>(x, trellis, suh, svh, shard_of_nb, out, M, Kdim, N, q);
+        if (done) return;
+    }
+    bool use_vec = M <= g_vec_max_m;
+    int MR = M <= 1 ? 1 : (M <= 2 ? 2 : (M <= 4 ? 4 : 8));
+#ifdef EXL3_DPAS_MB4
+    int MB = M <= 4 ? 4 : (M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 32 ? 32 : 64)));
+#elif defined(EXL3_DPAS_MB24) && defined(EXL3_DPAS_MB48)
+    int MB = M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 24 ? 24 : (M <= 32 ? 32 : (M <= 40 ? 40 : (M <= 48 ? 48 : 64)))));
+#elif defined(EXL3_DPAS_MB24)
+    int MB = M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 24 ? 24 : (M <= 32 ? 32 : 64)));
+#else
+    int MB = M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 32 ? 32 : 64));
+#endif
+    if (MB > g_max_mb) MB = g_max_mb;
+    int m_blocks = use_vec ? 1 : (M + MB - 1) / MB;
+    int Mp = use_vec ? M : m_blocks * MB;
+    // blocked activations [S][Mp][Kdim] (row-blocked inside); pad rows must be zero for DPAS
+    auto xh = Mp == M ? at::empty({S, Mp, Kdim}, x.options().dtype(at::kHalf))
+                      : at::zeros({S, Mp, Kdim}, x.options().dtype(at::kHalf));
+    if (x.scalar_type() == at::kHalf) launch_had_in<fp16>(x, suh, xh, q);
+    else if (x.scalar_type() == at::kBFloat16) launch_had_in<sycl::ext::oneapi::bfloat16>(x, suh, xh, q);
+    else TORCH_CHECK(false, "x dtype");
+
+    int tk = Kdim / 16;
+    int n_strips = (N / 16) / (use_vec ? nt_for(K, MR) : dpas_nt(MB));
+    int units = n_strips * m_blocks;
+    int target = use_vec ? g_target_threads
+               : (MB <= 16 ? g_target_threads_mb16 : (MB >= 40 ? g_target_threads_mb64 : g_target_threads));
+    int P = std::max(1, std::min(tk, (target + units - 1) / units));
+    int rps = (tk + P - 1) / P;
+    P = (tk + rps - 1) / rps;
+    auto part = at::empty({P, M, N}, x.options().dtype(at::kFloat));
+
+    bool ok = false;
+#ifdef EXL3_DEBUG_SKIP_GEMV
+    ok = true; K = -1;
+#endif
+#define EXL3_CASE(KK, CC) \
+    if (K == KK && cb == CC) ok = use_vec ? dispatch_mr<KK, CC>(MR, xh, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q) \
+                                          : dispatch_dpas<KK, CC>(MB, xh, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q);
+    EXL3_CASE(3, 2) EXL3_CASE(4, 2) EXL3_CASE(5, 2) EXL3_CASE(6, 2)
+#ifdef EXL3_ALL_CODEBOOKS
+    EXL3_CASE(2, 2)
+    EXL3_CASE(4, 0) EXL3_CASE(4, 1) EXL3_CASE(6, 0) EXL3_CASE(6, 1)
+#endif
+#undef EXL3_CASE
+    TORCH_CHECK(ok, "exl3_gemm_small: unsupported K/codebook ", K, "/", cb);
+
+    if (out.scalar_type() == at::kHalf) launch_had_out<fp16>(part, P, svh, out, q);
+    else if (out.scalar_type() == at::kBFloat16) launch_had_out<sycl::ext::oneapi::bfloat16>(part, P, svh, out, q);
+    else if (out.scalar_type() == at::kFloat) launch_had_out<float>(part, P, svh, out, q);
+    else TORCH_CHECK(false, "out dtype");
+}
+
+
+template <int K, int CB>
+static void launch_reconstruct(const at::Tensor& tr, at::Tensor& w, int n0, sycl::queue& q) {
+    int tk = tr.size(0), tiles_n = tr.size(1), n_out = w.size(1);
+    constexpr int NT = 8;   // 128 columns per thread (reconstruct slices are multiples of 128)
+    int n_strips = n_out / (16 * NT);
+    ReconstructKernel<K, CB, NT> k{reinterpret_cast<const uint32_t*>(tr.data_ptr()),
+                                   reinterpret_cast<fp16*>(w.data_ptr()), tiles_n, n0 / 16, n_out, n_strips, tk};
+    int n = n_strips * tk, local = 8;
+    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(round_up(n, local), local), k); });
+}
+
+#ifdef EXL3_DNNL
+#include <oneapi/dnnl/dnnl.hpp>
+#include <oneapi/dnnl/dnnl_sycl.hpp>
+// y[:, cols] (fp16, row stride ldy) = (xq[M,K] @ wq[K,N]) * sw * sx[m]: int8 XMX GEMM with the dequant fused,
+// so the output Hadamard reads fp16 instead of int32. Primitives cached per (M, K, N, ldy).
+namespace q8dnnl {
+struct Ctx { dnnl::engine eng; dnnl::stream strm; };
+static Ctx& ctx(sycl::queue& q) {
+    static std::map<void*, Ctx> m;
+    void* key = (void*)&q;
+    auto it = m.find(key);
+    if (it == m.end()) {
+        auto eng = dnnl::sycl_interop::make_engine(q.get_device(), q.get_context());
+        it = m.emplace(key, Ctx{eng, dnnl::sycl_interop::make_stream(eng, q)}).first;
+    }
+    return it->second;
+}
+static void gemm(sycl::queue& q, const at::Tensor& like, const int8_t* xq, const int8_t* wq, const float* sw_dev, const float* sx, fp16* y,
+                   int64_t M, int64_t K, int64_t N, int64_t ldy) {
+    using namespace dnnl;
+    using dt = memory::data_type;
+    auto& c = ctx(q);
+    // scratchpad in user mode, allocated through torch (library-mode scratch lives outside vLLM's memory budget)
+    static std::map<std::tuple<int64_t, int64_t, int64_t, int64_t>, std::pair<dnnl::matmul, size_t>> cache;
+    auto key = std::make_tuple(M, K, N, ldy);
+    memory::desc a_md({M, K}, dt::s8, memory::dims{K, 1});
+    memory::desc b_md({K, N}, dt::s8, memory::dims{N, 1});
+    memory::desc c_md({M, N}, dt::f16, memory::dims{ldy, 1});
+    memory::desc sx_md({M, 1}, dt::f32, memory::dims{1, 1});
+    memory::desc sw_md({1}, dt::f32, memory::dims{1});
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+        primitive_attr attr;
+        attr.set_scales_mask(DNNL_ARG_WEIGHTS, 0);
+        post_ops po;
+        po.append_binary(algorithm::binary_mul, sx_md);
+        attr.set_post_ops(po);
+        attr.set_scratchpad_mode(scratchpad_mode::user);
+        auto pd = dnnl::matmul::primitive_desc(c.eng, a_md, b_md, c_md, attr);
+        it = cache.emplace(key, std::make_pair(dnnl::matmul(pd), (size_t)pd.scratchpad_desc().get_size())).first;
+    }
+    at::Tensor scratch = at::empty({(int64_t)std::max<size_t>(it->second.second, 1)}, like.options().dtype(at::kByte));
+    auto mk = [&](const memory::desc& md, const void* p) {
+        return sycl_interop::make_memory(md, c.eng, sycl_interop::memory_kind::usm, const_cast<void*>(p));
+    };
+    memory::desc sp_md({(int64_t)it->second.second}, dt::u8, memory::dims{1});
+    sycl_interop::execute(it->second.first, c.strm,
+                          {{DNNL_ARG_SRC, mk(a_md, xq)}, {DNNL_ARG_WEIGHTS, mk(b_md, wq)}, {DNNL_ARG_DST, mk(c_md, y)},
+                           {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, mk(sw_md, sw_dev)},
+                           {DNNL_ARG_ATTR_MULTIPLE_POST_OP(0) | DNNL_ARG_SRC_1, mk(sx_md, sx)},
+                           {DNNL_ARG_SCRATCHPAD, mk(sp_md, scratch.data_ptr())}});
+}
+}  // namespace q8dnnl
+#endif
+
+#ifdef EXL3_DNNL
+#include <oneapi/dnnl/dnnl_graph.hpp>
+#include <oneapi/dnnl/dnnl_graph_sycl.hpp>
+#include <c10/xpu/XPUCachingAllocator.h>
+// Prefill attention through oneDNN Graph SDPA (fused, ~95 TF at head_dim 256 vs ~76 for FA2).
+// Head-major: q [Hq, Q, D], k/v [Hk, L, D] fp16 (GQA, Hq = G*Hk), out [Hq, Q, D]; causal = bottom-right aligned.
+// With lse defined ([Hq, Q] f32), the softmax log-sum-exp (natural log) is written there (softmax stats output).
+namespace sdpadnnl {
+using namespace dnnl::graph;
+using lt = logical_tensor;
+static void* alloc_fn(size_t n, size_t, const void*, const void*) { return c10::xpu::XPUCachingAllocator::raw_alloc(n); }
+static void free_fn(void* p, const void*, const void*, void*) { c10::xpu::XPUCachingAllocator::raw_delete(p); }
+struct Ctx { dnnl::engine eng; dnnl::stream strm; };
+static Ctx& ctx(sycl::queue& q) {
+    static std::map<void*, Ctx> m;
+    auto it = m.find((void*)&q);
+    if (it == m.end()) {
+        auto alloc = sycl_interop::make_allocator(alloc_fn, free_fn);
+        auto eng = sycl_interop::make_engine_with_allocator(q.get_device(), q.get_context(), alloc);
+        it = m.emplace((void*)&q, Ctx{eng, dnnl::sycl_interop::make_stream(eng, q)}).first;
+    }
+    return it->second;
+}
+struct Entry { compiled_partition cp; std::vector<lt> ins, outs; };
+static Entry& build(Ctx& c, int64_t Q, int64_t L, int64_t Hq, int64_t Hk, int64_t D, bool causal, bool with_lse) {
+    static std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, bool, bool>, Entry> cache;
+    auto key = std::make_tuple(Q, L, Hq, Hk, D, causal, with_lse);
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    const int64_t G = Hq / Hk;
+    using dt = lt::data_type;
+    size_t id = 0;
+    // 5D views of the natural vLLM layouts (no copies): [1, Hk, G, Q, D] / [1, Hk, 1, L, D]
+    lt query(id++, dt::f16, {1, Hk, G, Q, D}, {Hq * Q * D, G * Q * D, Q * D, D, 1});
+    lt keyt(id++, dt::f16, {1, Hk, 1, L, D}, {Hk * L * D, L * D, L * D, D, 1});
+    lt score(id++, dt::f32, {1, Hk, G, Q, L}, lt::layout_type::strided);
+    op bmm1(id++, op::kind::MatMul, "bmm1"); bmm1.set_attr<bool>(op::attr::transpose_b, true);
+    bmm1.add_inputs({query, keyt}); bmm1.add_outputs({score});
+    lt scale(id++, dt::f16, lt::dims{1}, lt::layout_type::strided);   // divisor sqrt(D), as in oneDNN's gqa example
+    lt scaled(id++, dt::f32, {1, Hk, G, Q, L}, lt::layout_type::strided);
+    op mul(id++, op::kind::Divide, "scale"); mul.add_inputs({score, scale}); mul.add_outputs({scaled});
+    std::vector<op> ops{bmm1, mul};
+    lt sm_in = scaled;
+    std::vector<lt> extra_ins;
+    if (causal) {
+        lt row(id++, dt::s32, {1, Hk, G, Q, L}, lt::layout_type::strided);
+        op gr(id++, op::kind::GenIndex, "row"); gr.set_attr<int64_t>(op::attr::axis, -2); gr.add_inputs({scaled}); gr.add_outputs({row});
+        lt lk(id++, dt::s32, 0, lt::layout_type::strided, lt::property_type::host_scalar);
+        lt ra(id++, dt::s32, {1, Hk, G, Q, L}, lt::layout_type::strided);
+        op add(id++, op::kind::Add, "row+L"); add.add_inputs({row, lk}); add.add_outputs({ra});
+        lt lq(id++, dt::s32, 0, lt::layout_type::strided, lt::property_type::host_scalar);
+        lt rs(id++, dt::s32, {1, Hk, G, Q, L}, lt::layout_type::strided);
+        op sub(id++, op::kind::Subtract, "-Q"); sub.add_inputs({ra, lq}); sub.add_outputs({rs});
+        lt col(id++, dt::s32, {1, Hk, G, Q, L}, lt::layout_type::strided);
+        op gc(id++, op::kind::GenIndex, "col"); gc.set_attr<int64_t>(op::attr::axis, -1); gc.add_inputs({scaled}); gc.add_outputs({col});
+        lt ge(id++, dt::boolean, {1, Hk, G, Q, L}, lt::layout_type::strided);
+        op gop(id++, op::kind::GreaterEqual, "ge"); gop.add_inputs({rs, col}); gop.add_outputs({ge});
+        lt ninf(id++, dt::f32, lt::dims{1}, lt::layout_type::strided);
+        lt masked(id++, dt::f32, {1, Hk, G, Q, L}, lt::layout_type::strided);
+        op sel(id++, op::kind::Select, "sel"); sel.add_inputs({ge, scaled, ninf}); sel.add_outputs({masked});
+        ops.insert(ops.end(), {gr, add, sub, gc, gop, sel});
+        extra_ins = {lk, lq, ninf};
+        sm_in = masked;
+    }
+    lt probs(id++, dt::f16, {1, Hk, G, Q, L}, lt::layout_type::strided);
+    op sm(id++, op::kind::SoftMax, "softmax"); sm.set_attr<int64_t>(op::attr::axis, -1);
+    sm.set_attr<std::string>(op::attr::mode, "inf_as_zero");
+    sm.add_inputs({sm_in}); 
+    lt stats(id++, dt::f32, {1, Hk, G, Q, 1}, {Hq * Q, G * Q, Q, 1, 1});
+    if (with_lse) sm.add_outputs({probs, stats}); else sm.add_outputs({probs});
+    lt value(id++, dt::f16, {1, Hk, 1, L, D}, {Hk * L * D, L * D, L * D, D, 1});
+    lt output(id++, dt::f16, {1, Hk, G, Q, D}, {Hq * Q * D, G * Q * D, Q * D, D, 1});
+    op bmm2(id++, op::kind::MatMul, "bmm2"); bmm2.add_inputs({probs, value}); bmm2.add_outputs({output});
+    ops.insert(ops.end(), {sm, bmm2});
+    graph g(dnnl::engine::kind::gpu);
+    for (auto& o : ops) g.add_op(o);
+    g.finalize();
+    auto parts = g.get_partitions();
+    TORCH_CHECK(parts.size() == 1, "oneDNN SDPA: pattern not fused (", parts.size(), " partitions)");
+    std::vector<lt> ins{query, keyt, scale};
+    ins.insert(ins.end(), extra_ins.begin(), extra_ins.end());
+    ins.push_back(value);
+    std::vector<lt> outs{output};
+    if (with_lse) outs.push_back(stats);
+    auto cp = parts[0].compile(ins, outs, c.eng);
+    return cache.emplace(key, Entry{cp, ins, outs}).first->second;
+}
+}  // namespace sdpadnnl
+
+static void sdpa_impl(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor out, at::Tensor lse, bool causal, double scale,
+                      int64_t len_k, int64_t len_q);
+void exl3_sdpa(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor out, at::Tensor lse, bool causal, double scale) {
+    sdpa_impl(q, k, v, out, lse, causal, scale, k.size(1), q.size(1));
+}
+// Padded dims, real lengths for the bottom-right mask: keys >= len_k are masked for every row.
+void exl3_sdpa_len(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor out, at::Tensor lse, bool causal, double scale,
+                   int64_t len_k, int64_t len_q) {
+    TORCH_CHECK(causal, "exl3_sdpa_len: causal only");
+    sdpa_impl(q, k, v, out, lse, causal, scale, len_k, len_q);
+}
+static void sdpa_impl(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor out, at::Tensor lse, bool causal, double scale,
+                      int64_t len_k, int64_t len_q) {
+    TORCH_CHECK(q.scalar_type() == at::kHalf && k.scalar_type() == at::kHalf && v.scalar_type() == at::kHalf);
+    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous() && out.is_contiguous());
+    int64_t Hq = q.size(0), Q = q.size(1), D = q.size(2), Hk = k.size(0), L = k.size(1);
+    auto& qq = queue_of(q);
+    auto& c = sdpadnnl::ctx(qq);
+    bool with_lse = lse.defined() && lse.numel() > 0;
+    auto& e = sdpadnnl::build(c, Q, L, Hq, Hk, D, causal, with_lse);
+    using dnnl::graph::tensor;
+    static std::vector<at::Tensor> sc(16), ni(16);
+    auto& st = sc.at(q.device().index());
+    if (!st.defined() || std::abs(st.item<float>() - (float)(1.0 / scale)) > 1e-3f) st = at::full({1}, (float)(1.0 / scale), q.options().dtype(at::kHalf));
+    auto& nt = ni.at(q.device().index());
+    if (!nt.defined()) nt = at::full({1}, -std::numeric_limits<float>::infinity(), q.options().dtype(at::kFloat));
+    int32_t lk = (int32_t)len_k, lq = (int32_t)len_q;
+    std::vector<tensor> ins{tensor(e.ins[0], c.eng, q.data_ptr()), tensor(e.ins[1], c.eng, k.data_ptr()),
+                            tensor(e.ins[2], c.eng, st.data_ptr())};
+    size_t vi = 3;
+    if (causal) {
+        ins.push_back(tensor::make_scalar_tensor(e.ins[3], &lk));
+        ins.push_back(tensor::make_scalar_tensor(e.ins[4], &lq));
+        ins.push_back(tensor(e.ins[5], c.eng, nt.data_ptr()));
+        vi = 6;
+    }
+    ins.push_back(tensor(e.ins[vi], c.eng, v.data_ptr()));
+    std::vector<tensor> outs{tensor(e.outs[0], c.eng, out.data_ptr())};
+    if (with_lse) outs.push_back(tensor(e.outs[1], c.eng, lse.data_ptr()));
+    dnnl::graph::sycl_interop::execute(e.cp, c.strm, ins, outs);
+}
+#endif
+
+// W8A8 prefill (opt-in): mul1 codebook values are bounded by 3.453125, one static int8 scale for every tensor
+static bool g_int8 = false;
+void exl3_set_int8(int64_t on) { g_int8 = on != 0; }
+constexpr float kQ8WMax = 3.453125f;
+
+template <int K>
+static void launch_reconstruct_q8(const at::Tensor& tr, at::Tensor& w, int n0, sycl::queue& q) {
+    int tk = tr.size(0), tiles_n = tr.size(1), n_out = w.size(1);
+    constexpr int NT = 8;
+    int n_strips = n_out / (16 * NT);
+    ReconstructKernel<K, 2, NT, int8_t> k{reinterpret_cast<const uint32_t*>(tr.data_ptr()),
+                                          reinterpret_cast<int8_t*>(w.data_ptr()), tiles_n, n0 / 16, n_out, n_strips, tk,
+                                          127.0f / kQ8WMax};
+    int n = n_strips * tk, local = 8;
+    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(round_up(n, local), local), k); });
+}
+
+void exl3_reconstruct(at::Tensor trellis, at::Tensor w, int64_t n0, int64_t K, int64_t cb) {
+    TORCH_CHECK(w.scalar_type() == at::kHalf && w.is_contiguous() && w.size(1) % 128 == 0 && n0 % 128 == 0);
+    TORCH_CHECK(w.size(0) == trellis.size(0) * 16 && n0 + w.size(1) <= trellis.size(1) * 16);
+    auto& q = queue_of(w);
+    bool ok = true;
+    if (K == 4 && cb == 2) launch_reconstruct<4, 2>(trellis, w, n0, q);
+    else if (K == 6 && cb == 2) launch_reconstruct<6, 2>(trellis, w, n0, q);
+    else if (K == 3 && cb == 2) launch_reconstruct<3, 2>(trellis, w, n0, q);   // Qwen3.8-Flash-Next routed experts
+    else if (K == 5 && cb == 2) launch_reconstruct<5, 2>(trellis, w, n0, q);   // ... and its 5-bit dense linears
+#ifdef EXL3_ALL_CODEBOOKS
+    else if (K == 2 && cb == 2) launch_reconstruct<2, 2>(trellis, w, n0, q);
+    else if (K == 4 && cb == 1) launch_reconstruct<4, 1>(trellis, w, n0, q);
+    else if (K == 4 && cb == 0) launch_reconstruct<4, 0>(trellis, w, n0, q);
+#endif
+    else ok = false;
+    TORCH_CHECK(ok, "exl3_reconstruct: unsupported K/cb");
+}
+
+// Debug/verification: part = xh_blocked @ W_inner via a forced path (0 = vector, 1 = DPAS), summed over splits.
+at::Tensor exl3_gemm_raw(at::Tensor xh_blocked, at::Tensor trellis, at::Tensor shard_of_nb, int64_t N, int64_t K,
+                         int64_t cb, int64_t path) {
+    auto& q = queue_of(xh_blocked);
+    int S = xh_blocked.size(0), Kdim = xh_blocked.size(1) * 16, M = xh_blocked.size(2);
+    bool use_vec = path == 0;
+    if (!use_vec) {
+#if defined(EXL3_DPAS_MB24) && defined(EXL3_DPAS_MB48)
+        int MBp = M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 24 ? 24 : (M <= 32 ? 32 : (M <= 40 ? 40 : (M <= 48 ? 48 : 64)))));
+#elif defined(EXL3_DPAS_MB24)
+        int MBp = M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 24 ? 24 : (M <= 32 ? 32 : 64)));
+#else
+        int MBp = M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 32 ? 32 : 64));
+#endif
+        int Mp = (M + MBp - 1) / MBp * MBp;
+        if (Mp != M) xh_blocked = at::constant_pad_nd(xh_blocked, {0, 0, 0, Mp - M}).contiguous();
+    }
+    int MR = M <= 1 ? 1 : (M <= 2 ? 2 : (M <= 4 ? 4 : 8));
+#ifdef EXL3_DPAS_MB4
+    int MB = M <= 4 ? 4 : (M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 32 ? 32 : 64)));
+#elif defined(EXL3_DPAS_MB24) && defined(EXL3_DPAS_MB48)
+    int MB = M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 24 ? 24 : (M <= 32 ? 32 : (M <= 40 ? 40 : (M <= 48 ? 48 : 64)))));
+#elif defined(EXL3_DPAS_MB24)
+    int MB = M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 24 ? 24 : (M <= 32 ? 32 : 64)));
+#else
+    int MB = M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 32 ? 32 : 64));
+#endif
+    int tk = Kdim / 16;
+    int P = 4, rps = (tk + P - 1) / P; P = (tk + rps - 1) / rps;
+    auto part = at::zeros({P, M, N}, xh_blocked.options().dtype(at::kFloat));
+    bool ok = false;
+    if (K == 4 && cb == 2) ok = use_vec ? dispatch_mr<4, 2>(MR, xh_blocked, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q)
+                                        : dispatch_dpas<4, 2>(MB, xh_blocked, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q);
+    if (K == 6 && cb == 2) ok = use_vec ? dispatch_mr<6, 2>(MR, xh_blocked, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q)
+                                        : dispatch_dpas<6, 2>(MB, xh_blocked, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q);
+    if (K == 3 && cb == 2) ok = use_vec ? dispatch_mr<3, 2>(MR, xh_blocked, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q)
+                                        : dispatch_dpas<3, 2>(MB, xh_blocked, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q);
+    if (K == 5 && cb == 2) ok = use_vec ? dispatch_mr<5, 2>(MR, xh_blocked, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q)
+                                        : dispatch_dpas<5, 2>(MB, xh_blocked, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q);
+    TORCH_CHECK(ok);
+    (void)S;
+    return part.sum(0);
+}
+
+// Prefill helpers: row-major input Hadamard (GEMM operand) and fp16 output Hadamard.
+void exl3_had_in_rm(at::Tensor x, at::Tensor suh, at::Tensor xh) {
+    TORCH_CHECK(xh.scalar_type() == at::kHalf && xh.is_contiguous() && xh.size(1) == x.size(0));
+    auto& q = queue_of(x);
+    if (x.scalar_type() == at::kHalf) launch_had_in<fp16>(x, suh, xh, q, true);
+    else if (x.scalar_type() == at::kBFloat16) launch_had_in<sycl::ext::oneapi::bfloat16>(x, suh, xh, q, true);
+    else TORCH_CHECK(false, "x dtype");
+}
+
+void exl3_had_out_h(at::Tensor y, at::Tensor svh, at::Tensor out) {
+    TORCH_CHECK(y.scalar_type() == at::kHalf && y.is_contiguous() && y.sizes() == out.sizes());
+    auto& q = queue_of(y);
+    if (out.scalar_type() == at::kHalf) launch_had_out<fp16, fp16>(y, 1, svh, out, q);
+    else if (out.scalar_type() == at::kBFloat16) launch_had_out<sycl::ext::oneapi::bfloat16, fp16>(y, 1, svh, out, q);
+    else TORCH_CHECK(false, "out dtype");
+}
+
+// ---- flash-attention forward (prefill), fp16, head_dim 256, GQA; returns O and natural-log LSE
+void exl3_fa_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor out, at::Tensor lse, bool causal, double scale) {
+    TORCH_CHECK(q.scalar_type() == at::kHalf && k.scalar_type() == at::kHalf && v.scalar_type() == at::kHalf);
+    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous() && out.is_contiguous() && lse.is_contiguous());
+    TORCH_CHECK(q.size(2) == 256 && k.size(2) == 256, "head_dim 256 only");
+    int Lq = q.size(0), Hq = q.size(1), Lk = k.size(0), Hk = k.size(1);
+    TORCH_CHECK(Hq % Hk == 0);
+    int G = Hq / Hk;
+    auto& qq = queue_of(q);
+    exl3fa::FaKernel kern{reinterpret_cast<const sycl::half*>(q.data_ptr()), reinterpret_cast<const sycl::half*>(k.data_ptr()),
+                          reinterpret_cast<const sycl::half*>(v.data_ptr()), reinterpret_cast<sycl::half*>(out.data_ptr()),
+                          lse.data_ptr<float>(), Lq, Lk, Hq, Hk, G, (float)(scale * 1.4426950408889634), causal ? 1 : 0};
+    int qtiles = (Lq + exl3fa::QR - 1) / exl3fa::QR;
+    int n = qtiles * Hk * G;
+    sycl::ext::oneapi::experimental::properties props{sycl::ext::intel::experimental::grf_size<256>};
+    qq.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(n, G), props, kern); });
+}
+
+bool exl3_supported(int64_t K, int64_t cb);
+
+// ------------------------------------------------------------------------------------------------
+// The whole EXL3 linear as one C++ op (no Python on the per-call path).
+//   M <= small_m_max : fused decode-in-GEMM (vector / DPAS)
+//   otherwise        : row-major input Hadamard -> reconstruct W_inner slices -> oneDNN GEMM -> output Hadamard
+
+static at::Tensor& weight_scratch(const at::Device& dev, int64_t numel) {
+    static std::vector<at::Tensor> bufs(16);
+    auto& b = bufs.at(dev.index());
+    if (!b.defined() || b.numel() < numel)
+        b = at::empty({numel}, at::TensorOptions().dtype(at::kHalf).device(dev));
+    return b;
+}
+
+at::Tensor exl3_linear(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Tensor svh, at::Tensor shard_of_nb,
+                       std::vector<int64_t> group_bounds, int64_t K, int64_t cb, int64_t small_m_max,
+                       int64_t slice_n) {
+    auto shape = x.sizes().vec();
+    int64_t k = shape.back();
+    int64_t n = svh.size(0);
+    auto x2 = x.reshape({-1, k});
+    if (!x2.is_contiguous()) x2 = x2.contiguous();
+    int64_t M = x2.size(0);
+    shape.back() = n;
+    auto out = at::empty({M, n}, x.options());
+    if (M == 0) return out.view(shape);
+    if (M <= small_m_max && exl3_supported(K, cb)) {
+        exl3_gemm_small(x2, trellis, suh, svh, shard_of_nb, out, K, cb);
+        return out.view(shape);
+    }
+    int64_t S = suh.size(0);
+    if (g_int8 && cb == 2 && (K == 4 || K == 6) && M > 16) {
+        auto& q = queue_of(x2);
+#ifdef EXL3_DNNL
+        // GEMM rows padded to 256: bounds the number of oneDNN primitives (one per (Ms, K, N)) on real traffic
+        const int64_t Ms = (M + 255) / 256 * 256;
+#else
+        const int64_t Ms = M;
+#endif
+        auto xq = at::empty({S, Ms, k}, x.options().dtype(at::kChar));
+        auto sx = at::empty({S, Ms}, x.options().dtype(at::kFloat));
+        int n_in = S * M, local = 8;
+        auto run_in = [&](auto tag) {
+            using TIn = decltype(tag);
+            int kb_n = (int)(k / 128);
+            auto wg = [&](auto kern, int tpr) {
+                q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((size_t)n_in * tpr, tpr), kern); });
+            };
+            if (kb_n <= 8 * 6) {
+                wg(HadInQ8WgKernel<TIn, 8, 6>{reinterpret_cast<const TIn*>(x2.data_ptr()), reinterpret_cast<const fp16*>(suh.data_ptr()),
+                                              reinterpret_cast<int8_t*>(xq.data_ptr()), sx.data_ptr<float>(), (int)M, (int)k, (int)S,
+                                              (int)x2.stride(0), (int)Ms}, 8);
+                return;
+            }
+            if (kb_n <= 16 * 9) {
+                wg(HadInQ8WgKernel<TIn, 16, 9>{reinterpret_cast<const TIn*>(x2.data_ptr()), reinterpret_cast<const fp16*>(suh.data_ptr()),
+                                               reinterpret_cast<int8_t*>(xq.data_ptr()), sx.data_ptr<float>(), (int)M, (int)k, (int)S,
+                                               (int)x2.stride(0), (int)Ms}, 16);
+                return;
+            }
+            HadInQ8Kernel<TIn> kin{reinterpret_cast<const TIn*>(x2.data_ptr()), reinterpret_cast<const fp16*>(suh.data_ptr()),
+                                   reinterpret_cast<int8_t*>(xq.data_ptr()), sx.data_ptr<float>(), (int)M, (int)k, (int)S,
+                                   (int)x2.stride(0), (int)Ms};
+            q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(round_up(n_in, local), local), kin); });
+        };
+        if (x2.scalar_type() == at::kHalf) run_in(fp16{});
+        else if (x2.scalar_type() == at::kBFloat16) run_in(sycl::ext::oneapi::bfloat16{});
+        else TORCH_CHECK(false, "x dtype");
+        const float sw = kQ8WMax / 127.0f;
+#ifdef EXL3_DNNL
+        {
+            static std::vector<at::Tensor> swd(16);
+            auto& swt = swd.at(x.device().index());
+            if (!swt.defined()) swt = at::full({1}, sw, x.options().dtype(at::kFloat));
+            auto y = at::empty({Ms, n}, x.options().dtype(at::kHalf));
+            for (size_t g = 0; g + 1 < group_bounds.size(); ++g) {
+                int64_t g0 = group_bounds[g], g1 = group_bounds[g + 1], ng = g1 - g0;
+                auto w = at::empty({k, ng}, x.options().dtype(at::kChar));
+                if (K == 4) launch_reconstruct_q8<4>(trellis, w, g0, q); else launch_reconstruct_q8<6>(trellis, w, g0, q);
+                q8dnnl::gemm(q, x, reinterpret_cast<const int8_t*>(xq.data_ptr()) + g * Ms * k,
+                             reinterpret_cast<const int8_t*>(w.data_ptr()), swt.data_ptr<float>(),
+                             sx.data_ptr<float>() + g * Ms, reinterpret_cast<fp16*>(y.data_ptr()) + g0, Ms, k, ng, n);
+            }
+            exl3_had_out_h(y.narrow(0, 0, M), svh, out);
+            return out.view(shape);
+        }
+#endif
+        for (size_t g = 0; g + 1 < group_bounds.size(); ++g) {
+            int64_t g0 = group_bounds[g], g1 = group_bounds[g + 1], ng = g1 - g0;
+            auto w = at::empty({k, ng}, x.options().dtype(at::kChar));
+            if (K == 4) launch_reconstruct_q8<4>(trellis, w, g0, q); else launch_reconstruct_q8<6>(trellis, w, g0, q);
+            auto y = at::_int_mm(xq[g], w);                                   // [M, ng] int32
+            int n_out = M * (ng / 128);
+            auto run_out = [&](auto tag) {
+                using TOut = decltype(tag);
+                HadOutQ8Kernel<TOut> ko{y.data_ptr<int32_t>(), sx.data_ptr<float>() + g * M,
+                                        reinterpret_cast<const fp16*>(svh.data_ptr()) + g0,
+                                        reinterpret_cast<TOut*>(out.data_ptr()) + g0, (int)M, (int)ng, (int)n, sw};
+                q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(round_up(n_out, local), local), ko); });
+            };
+            if (out.scalar_type() == at::kHalf) run_out(fp16{});
+            else run_out(sycl::ext::oneapi::bfloat16{});
+        }
+        return out.view(shape);
+    }
+    auto xh = at::empty({S, M, k}, x.options().dtype(at::kHalf));
+    exl3_had_in_rm(x2, suh, xh);
+    auto y = at::empty({M, n}, x.options().dtype(at::kHalf));
+    for (size_t g = 0; g + 1 < group_bounds.size(); ++g) {
+        int64_t g0 = group_bounds[g], g1 = group_bounds[g + 1];
+        for (int64_t n0 = g0; n0 < g1; n0 += slice_n) {
+            int64_t n1 = std::min(n0 + slice_n, g1);
+            auto w = weight_scratch(x.device(), k * (n1 - n0)).narrow(0, 0, k * (n1 - n0)).view({k, n1 - n0});
+            exl3_reconstruct(trellis, w, n0, K, cb);
+            auto yslice = y.narrow(1, n0, n1 - n0);
+            at::matmul_out(yslice, xh[g], w);
+        }
+    }
+    exl3_had_out_h(y, svh, out);
+    return out.view(shape);
+}
+
+at::Tensor exl3_linear_meta(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Tensor svh, at::Tensor shard_of_nb,
+                            std::vector<int64_t> group_bounds, int64_t K, int64_t cb, int64_t small_m_max,
+                            int64_t slice_n) {
+    auto shape = x.sizes().vec();
+    shape.back() = svh.size(0);
+    return at::empty(shape, x.options());
+}
+
+bool exl3_supported(int64_t K, int64_t cb) {
+    if (cb == 2 && (K == 3 || K == 4 || K == 5 || K == 6)) return true;
+#ifdef EXL3_ALL_CODEBOOKS
+    if (cb == 2 && K == 2) return true;
+    if ((cb == 0 || cb == 1) && (K == 4 || K == 6)) return true;
+#endif
+    return false;
+}
+
+void exl3_set_target_threads(int64_t n) { g_target_threads = (int)n; }
+void exl3_set_target_threads_mb64(int64_t n) { g_target_threads_mb64 = (int)n; }
+void exl3_set_target_threads_mb16(int64_t n) { g_target_threads_mb16 = (int)n; }
+void exl3_set_vec_max_m(int64_t n) { g_vec_max_m = (int)n; }
+
+TORCH_LIBRARY(exl3xpu_C, m) {
+    m.def("exl3_set_int8(int on) -> ()", &exl3_set_int8);
+#ifdef EXL3_DNNL
+    m.def("exl3_sdpa(Tensor q, Tensor k, Tensor v, Tensor(a!) out, Tensor(b!) lse, bool causal, float scale) -> ()");
+    m.impl("exl3_sdpa", torch::kXPU, &exl3_sdpa);
+    m.def("exl3_sdpa_len(Tensor q, Tensor k, Tensor v, Tensor(a!) out, Tensor(b!) lse, bool causal, float scale, int len_k, int len_q) -> ()");
+    m.impl("exl3_sdpa_len", torch::kXPU, &exl3_sdpa_len);
+#endif
+    m.def("linear(Tensor x, Tensor trellis, Tensor suh, Tensor svh, Tensor shard_of_nb, int[] group_bounds, int K, int cb, int small_m_max, int slice_n) -> Tensor");
+    m.impl("linear", torch::kXPU, &exl3_linear);
+    m.def("exl3_gemm_small(Tensor x, Tensor trellis, Tensor suh, Tensor svh, Tensor shard_of_nb, Tensor(a!) out, int K, int cb) -> ()");
+    m.impl("exl3_gemm_small", torch::kXPU, &exl3_gemm_small);
+    m.def("exl3_supported(int K, int cb) -> bool", &exl3_supported);
+    m.def("exl3_had_in_rm(Tensor x, Tensor suh, Tensor(a!) xh) -> ()");
+    m.impl("exl3_had_in_rm", torch::kXPU, &exl3_had_in_rm);
+    m.def("exl3_had_out_h(Tensor y, Tensor svh, Tensor(a!) out) -> ()");
+    m.impl("exl3_had_out_h", torch::kXPU, &exl3_had_out_h);
+    m.def("exl3_reconstruct(Tensor trellis, Tensor(a!) w, int n0, int K, int cb) -> ()");
+    m.impl("exl3_reconstruct", torch::kXPU, &exl3_reconstruct);
+    m.def("exl3_gemm_raw(Tensor xh_blocked, Tensor trellis, Tensor shard_of_nb, int N, int K, int cb, int path) -> Tensor");
+    m.impl("exl3_gemm_raw", torch::kXPU, &exl3_gemm_raw);
+    m.def("exl3_set_target_threads(int n) -> ()", &exl3_set_target_threads);
+    m.def("exl3_set_target_threads_mb64(int n) -> ()", &exl3_set_target_threads_mb64);
+    m.def("exl3_set_target_threads_mb16(int n) -> ()", &exl3_set_target_threads_mb16);
+    m.def("exl3_set_vec_max_m(int n) -> ()", &exl3_set_vec_max_m);
+    m.def("exl3_set_fused(int on) -> ()", &exl3_set_fused);
+    m.def("exl3_set_local(int n) -> ()", &exl3_set_local);
+    m.def("exl3_set_max_mb(int n) -> ()", &exl3_set_max_mb);
+    m.def("exl3_fa_fwd(Tensor q, Tensor k, Tensor v, Tensor(a!) out, Tensor(b!) lse, bool causal, float scale) -> ()");
+    m.impl("exl3_fa_fwd", torch::kXPU, &exl3_fa_fwd);
+}

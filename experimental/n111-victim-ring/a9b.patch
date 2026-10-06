@@ -1,0 +1,167 @@
+--- exl3_moe.a8.sycl	2026-10-06 15:13:29
++++ exl3_moe.sycl	2026-10-06 15:35:36
+@@ -29,6 +29,10 @@
+ #include <atomic>
+ #include <thread>
+ #include <memory>
++#include <deque>
++#include <mutex>
++#include <condition_variable>
++#include <array>
+ 
+ using namespace exl3;
+ using bf16 = sycl::ext::oneapi::bfloat16;
+@@ -764,6 +768,22 @@
+ // BEFORE the GEMV write-through fill overwrites the slot. nullptr = off (stock behaviour).
+ static int* g_vict = nullptr;
+ void moe_set_victims(at::Tensor v) { g_vict = v.numel() ? v.data_ptr<int>() : nullptr; }
++// a9 (N111): victim RING. When set (together with victims), ensure claims a ring slot per written-back victim and the
++// victim copy goes VRAM slot -> VRAM ring slot (D2D, microseconds) instead of to the host address; ram_res is NOT set.
++// The host drains the ring with copy-engine D2H on a side stream, flags the expert RAM-resident only after its event
++// completed, then frees the ring slot (key = -1, uploaded on the compute stream). Ring full -> the victim is DROPPED
++// (no write-back, as NOVICT; counted in meta[2]).
++// meta int32 [4 + 2K]: [0] next search position, [1] claim sequence (monotonic), [2] drops, [3] K,
++//                      key[K] (-1 free, else the victim key L*E+e awaiting write-back), seq[K] (claim sequence of key).
++// sel int32 [E]: ring slot per victim entry of the current call (-1 = no copy). buf: VRAM [K x blob].
++static int* g_vr_meta = nullptr; static int* g_vr_sel = nullptr; static int64_t g_vr_base = 0; static int g_vr_K = 0;
++void moe_set_victim_ring(at::Tensor meta, at::Tensor sel, at::Tensor buf) {
++    if (!meta.numel()) { g_vr_meta = nullptr; g_vr_sel = nullptr; g_vr_base = 0; g_vr_K = 0; return; }
++    TORCH_CHECK(meta.scalar_type() == at::kInt && sel.scalar_type() == at::kInt && meta.is_contiguous() && sel.is_contiguous());
++    int K = (int)((meta.numel() - 4) / 2);
++    TORCH_CHECK(K > 0 && meta.numel() == 4 + 2 * K && buf.numel() > 0, "victim ring: meta [4 + 2K], buf [K * blob]");
++    g_vr_meta = meta.data_ptr<int>(); g_vr_sel = sel.data_ptr<int>(); g_vr_base = (int64_t)buf.data_ptr(); g_vr_K = K;
++}
+ // a3: residency mask + miss ring. ram_res uint8 [L*E] (1 = the expert's RAM-tier address is backed and valid),
+ // miss ring int32 [1 + R] ([0] = monotonic count, keys at 1 + count % R), safe int32 [L] (an expert per layer that is
+ // always RAM-resident). Before each cached call, picks whose expert is in neither VRAM nor RAM are logged and replaced
+@@ -857,6 +877,7 @@
+     const uint8_t* m_rr = (mask_ids && mask_w) ? g_ram_res : nullptr;
+     int* m_ring = g_miss; const int m_cap = g_miss_cap; const int* m_safe = g_safe;
+     const uint8_t* v_rr = vict_out ? g_ram_res : nullptr;   // a7: skip write-back of victims whose RAM copy is resident
++    int* vr_meta = vict_out ? g_vr_meta : nullptr; int* vr_sel = g_vr_sel; const int vr_K = g_vr_K;   // a9 victim ring
+     constexpr int WG = 1024;
+     // Victim selection = exact LRU by radix select over u = slot_last + 1 (empty slots u = 0, slots touched this tick
+     // excluded): four 8-bit histogram passes find the nm-th smallest u (tau, ties needed), one compaction pass takes
+@@ -1026,6 +1047,25 @@
+             if (l == 0) {
+                 fill_list[0] = nm;
+                 if (vict_out) vict_out[0] = nm;
++                if (vr_meta) {
++                    // a9: claim ring slots serially (one work-item; nm and K are small). A slot is free only after the
++                    // host saw its D2H complete and wrote key = -1 between graph replays (same in-order queue).
++                    int* vk = vr_meta + 4; int* vs = vr_meta + 4 + vr_K;
++                    int p = vr_meta[0];
++                    for (int mi = 0; mi < nm; ++mi) {
++                        int old = vict_out[1 + 2 * mi], r = -1;
++                        if (old >= 0) {
++                            for (int j = 0; j < vr_K; ++j) {
++                                int qq = p + j; if (qq >= vr_K) qq -= vr_K;
++                                if (vk[qq] < 0) { r = qq; break; }
++                            }
++                            if (r >= 0) { vk[r] = old; vs[r] = ++vr_meta[1]; p = r + 1 == vr_K ? 0 : r + 1; }
++                            else vr_meta[2] += 1;
++                        }
++                        vr_sel[mi] = r;
++                    }
++                    vr_meta[0] = p;
++                }
+                 if (host_plan) {
+                     host_plan[1] = nm; host_plan[2] = T; host_plan[3] = layer;
+                     sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+@@ -1168,15 +1208,23 @@
+ struct VictimCopyKernel {
+     const int* vict; const int64_t* host_base; int64_t slot_base; int64_t blob; int E; int chunks; int64_t hstride;
+     uint8_t* ram_res;   // a6: mark the victim RAM-resident (later kernels on the in-order queue see it after this one)
++    const int* vr_sel = nullptr; int64_t vr_base = 0;   // a9: ring mode - copy into ring slot vr_sel[i], no ram_res
+     void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+         int wg = it.get_group(0), t = it.get_local_id(0);
+         int i = wg / chunks, c = wg % chunks;
+         if (i >= vict[0]) return;
+         int old = vict[1 + 2 * i], s = vict[2 + 2 * i];
+         if (old < 0) return;
+-        if (ram_res && c == 0 && t == 0) ram_res[old] = 1;
++        uint32_t* dst;
++        if (vr_sel) {
++            int r = vr_sel[i];
++            if (r < 0) return;                                  // ring full: dropped
++            dst = reinterpret_cast<uint32_t*>(vr_base + (int64_t)r * blob);
++        } else {
++            if (ram_res && c == 0 && t == 0) ram_res[old] = 1;
++            dst = reinterpret_cast<uint32_t*>(host_base[old / E] + (int64_t)(old % E) * hstride);
++        }
+         const uint32_t* src = reinterpret_cast<const uint32_t*>(slot_base + (int64_t)s * blob);
+-        uint32_t* dst = reinterpret_cast<uint32_t*>(host_base[old / E] + (int64_t)(old % E) * hstride);
+         int64_t nd = blob / 4;
+         int64_t d0 = (int64_t)c * 16384 + (int64_t)t * 1024;
+ #pragma unroll 4
+@@ -1253,7 +1301,8 @@
+         int mf = (int)std::min<int64_t>(std::min<int64_t>(max_fill, E), (int64_t)M * topk_ids.size(1));
+         int chunks = (int)((gm.blob() / 4 + 16383) / 16384);
+         VictimCopyKernel vk{g_vict, host_base.data_ptr<int64_t>(), slot_base, (int64_t)gm.blob(), E, chunks,
+-                            g_host_stride ? g_host_stride : (int64_t)gm.blob(), g_ram_res};
++                            g_host_stride ? g_host_stride : (int64_t)gm.blob(), g_ram_res,
++                            g_vr_meta ? g_vr_sel : nullptr, g_vr_meta ? g_vr_base : 0};
+         q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((size_t)mf * chunks * 16, 16), vk); });
+     }
+     return moe_forward_impl(x, topk_ids, topk_w, nullptr, ptrs_l, I, K, n_experts, fa + layer * E, pa + layer * E,
+@@ -1548,6 +1597,49 @@
+     q.memcpy(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src), (size_t)nbytes);
+ }
+ 
++// a9b (N111): victim-ring drain worker. A native thread with its own in-order queue copies ring slots to their RAM-tier
++// (pageable memfd) addresses: a D2H memcpy into pageable memory can block the submitting thread for the whole copy, so
++// the Python step only pushes jobs (no GIL held while copying) and later reads the completed sequence number.
++struct VrDrain {
++    sycl::queue q;
++    std::thread th; std::mutex mu; std::condition_variable cv;
++    std::deque<std::array<int64_t, 4>> jobs;   // src, dst, nbytes, seq
++    std::atomic<int64_t> done{0}; bool stop = false;
++    explicit VrDrain(sycl::queue q0) : q(q0.get_context(), q0.get_device(), sycl::property::queue::in_order()) {}
++    void run() {
++        std::vector<std::array<int64_t, 4>> batch;
++        for (;;) {
++            {
++                std::unique_lock<std::mutex> lk(mu);
++                cv.wait(lk, [&] { return stop || !jobs.empty(); });
++                if (jobs.empty()) return;
++                batch.assign(jobs.begin(), jobs.end()); jobs.clear();
++            }
++            for (auto& j : batch) q.memcpy(reinterpret_cast<void*>(j[1]), reinterpret_cast<const void*>(j[0]), (size_t)j[2]);
++            q.wait();
++            done.store(batch.back()[3], std::memory_order_release);
++        }
++    }
++};
++static std::unique_ptr<VrDrain> g_vrd; static int64_t g_vrd_seq = 0;
++int64_t moe_vring_drain_push(int64_t src, int64_t dst, int64_t nbytes) {
++    if (!g_vrd) {
++        g_vrd = std::make_unique<VrDrain>(c10::xpu::getCurrentXPUStream().queue());
++        g_vrd->th = std::thread([p = g_vrd.get()] { p->run(); });
++    }
++    int64_t sq = ++g_vrd_seq;
++    { std::lock_guard<std::mutex> lk(g_vrd->mu); g_vrd->jobs.push_back({src, dst, nbytes, sq}); }
++    g_vrd->cv.notify_one();
++    return sq;
++}
++int64_t moe_vring_drain_done() { return g_vrd ? g_vrd->done.load(std::memory_order_acquire) : 0; }
++int64_t moe_vring_drain_stop() {
++    if (!g_vrd) return 0;
++    { std::lock_guard<std::mutex> lk(g_vrd->mu); g_vrd->stop = true; }
++    g_vrd->cv.notify_one(); g_vrd->th.join();
++    int64_t d = g_vrd->done.load(); g_vrd.reset(); return d;
++}
++
+ int64_t blob_bytes(int64_t H, int64_t I, int64_t K) { return (int64_t)Geom{(int)H, (int)I, (int)K}.blob(); }
+ 
+ }  // namespace moe
+@@ -1586,6 +1678,10 @@
+     m.def("moe_set_pair_max_m(int v) -> ()", &moe::moe_set_pair_max_m);
+     m.def("moe_set_prefill_min_m(int v) -> ()", &moe::moe_set_prefill_min_m);
+     m.def("moe_set_victims(Tensor v) -> ()", &moe::moe_set_victims);
++    m.def("moe_set_victim_ring(Tensor meta, Tensor sel, Tensor buf) -> ()", &moe::moe_set_victim_ring);
++    m.def("moe_vring_drain_push(int src, int dst, int nbytes) -> int", &moe::moe_vring_drain_push);
++    m.def("moe_vring_drain_done() -> int", &moe::moe_vring_drain_done);
++    m.def("moe_vring_drain_stop() -> int", &moe::moe_vring_drain_stop);
+     m.def("moe_set_tier(Tensor ram_res, Tensor miss, Tensor safe) -> ()", &moe::moe_set_tier);
+     m.def("moe_set_host_stride(int s) -> ()", &moe::moe_set_host_stride);
+     m.def("moe_svm_prefetch(Tensor ptrs, int nbytes, Tensor like) -> ()", &moe::moe_svm_prefetch);

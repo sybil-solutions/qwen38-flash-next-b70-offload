@@ -1,0 +1,583 @@
+// N114: fused decode / verify QSA attention for Intel Xe2 (Arc Pro B70) as a torch XPU op library
+// (torch.ops.n114qsa.*), XPU-graph capturable (no host sync, every per-step scalar read on the device, launch shape a
+// function of (rows, index width) only, scratch via at::empty).
+//
+// One op replaces, per QSA layer and decode step, SGLang's non-CUDA paged path
+//   expand_qsa_block_indices (torch, ~20 kernels)  ->  _logical_to_physical (torch, ~8 kernels; exl3xpu maps through
+//   req_to_token in graph mode)  ->  qsa_sparse_attention (exl3xpu: torch reference in capture, ~15 kernels)
+// with two kernels:
+//   1. chunk kernel, one work-group per (row, kv head, split): each thread derives its cell's logical token
+//      (compressed block * ratio + offset masked to < seq_len, or one of the ratio - 1 pending-tail tokens, exactly as
+//      torch_expand_qsa_block_indices) and physical slot (table[row_of(seq), logical], valid iff 0 <= logical <
+//      row_len[seq], exactly as _logical_to_physical), then scores the chunk's cells for the kv head's 12 query heads
+//      (fp32), runs an online softmax across the split's chunks and accumulates P.V (fp32);
+//   2. log-sum-exp merge of the splits (Strata attn_merge_kernel), bf16 output (RNE).
+// Index-taking mode (expand = 0) skips the expansion and treats the [R, W] input as logical token indices.
+//
+// Semantics = SGLang qsa_sparse_attention_reference over the expanded slots: softmax over each row's valid slots only,
+// a row without a valid slot outputs exact 0, GQA q head h reads kv head h / 12, duplicate cells count twice.
+// Precision: fp32 scores (exact products of bf16 q and fp8/bf16 k), fp32 softmax (exp2, log2(e) folded into the
+// scale) and accumulation; the torch reference that graph decode runs today rounds scores and P to bf16.
+//
+// Structure (chunk kernel) = the n107-qsa/N108 "bcast" kernel (lane-per-cell Q.K with the q slice broadcast lane by
+// lane, chunk softmax, P.V with one thread per dimension) generalised to chunks of 64 / 128 / 256 cells: with CH < 256
+// cells the 256 / CH dimension quarters of a cell are scored by different sub-groups and summed in SLM, so every
+// sub-group works on small decode chunks. The split-K layout (one chunk per work-group by default) and the merge are
+// Strata's qsa_decode_attn_batch (sycl/src/kernels/cuda/qsa_decode_attn.dp.cpp).
+//
+// fp8 e4m3fn KV decode: mode 0 exact integer decode to fp32; mode 1 bits -> fp16 (exact; the 256 is folded into the q
+// scale and the output normalisation).
+//
+// ---------------------------------------------------------------------------------------------------------------
+// Portions (split-K chunk layout, the merge kernel, the per-query decode attention design) derived from Strata
+// (github.com/Niko1221/Strata, HEAD 82f46a8):
+//
+// MIT License
+//
+// Copyright (c) 2026 Niko1221 and the Strata contributors
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// ---------------------------------------------------------------------------------------------------------------
+
+#ifndef N114_NO_TORCH          // csrc/cpu_test_qsa.cpp includes this file without torch (OpenCL CPU device)
+#include <torch/all.h>
+#include <torch/library.h>
+#include <c10/xpu/XPUStream.h>
+#include <optional>
+#endif
+#include <sycl/sycl.hpp>
+
+#include <algorithm>
+#include <cfloat>
+#include <cstdint>
+#include <vector>
+
+namespace n114q {
+
+constexpr int HD = 256;            // head_dim
+constexpr int G = 12;              // query heads per kv head (24 / 2)
+constexpr int THREADS = 256;       // one thread per dimension in P.V
+constexpr float LOG2E = 1.4426950408889634f;
+constexpr float NEG = -FLT_MAX;    // masked score (finite: no inf arithmetic anywhere)
+
+enum : int { KV_BF16 = 0, KV_FP16 = 1, KV_FP8 = 2, KV_FP8H = 3 };
+
+template <int KVM> struct KVType { using T = uint16_t; };
+template <> struct KVType<KV_FP8> { using T = uint8_t; };
+template <> struct KVType<KV_FP8H> { using T = uint8_t; };
+
+static inline float e4m3_exact(uint32_t u) {
+    const uint32_t sign = (u & 0x80u) << 24;
+    const float normal = sycl::bit_cast<float>(sign | (((u & 0x7Fu) + 960u) << 20));   // (e + 120) << 23 | m << 20
+    const float subm = (float)(u & 7u) * 0.001953125f;                                  // m * 2^-9
+    const float sub = sycl::bit_cast<float>(sign | sycl::bit_cast<uint32_t>(subm));
+    return ((u >> 3) & 15u) ? normal : sub;
+}
+static inline float half_bits(uint32_t h) { return (float)sycl::bit_cast<sycl::half>((uint16_t)h); }
+static inline uint32_t e4m3x2_to_h2(uint32_t z) { return ((z & 0x00800080u) << 8) | ((z & 0x007F007Fu) << 7); }
+
+template <int KVM> static inline void dec_word(uint32_t w, float* o) {
+    if constexpr (KVM == KV_BF16) {
+        o[0] = sycl::bit_cast<float>(w << 16);
+        o[1] = sycl::bit_cast<float>(w & 0xFFFF0000u);
+    } else if constexpr (KVM == KV_FP16) {
+        o[0] = half_bits(w & 0xFFFFu);
+        o[1] = half_bits(w >> 16);
+    } else if constexpr (KVM == KV_FP8) {
+        o[0] = e4m3_exact(w & 255u);
+        o[1] = e4m3_exact((w >> 8) & 255u);
+        o[2] = e4m3_exact((w >> 16) & 255u);
+        o[3] = e4m3_exact(w >> 24);
+    } else {
+        const uint32_t lo = e4m3x2_to_h2((w & 0xFFu) | ((w & 0xFF00u) << 8));
+        const uint32_t hi = e4m3x2_to_h2(((w >> 16) & 0xFFu) | ((w >> 8) & 0xFF0000u));
+        o[0] = half_bits(lo & 0xFFFFu);
+        o[1] = half_bits(lo >> 16);
+        o[2] = half_bits(hi & 0xFFFFu);
+        o[3] = half_bits(hi >> 16);
+    }
+}
+template <int KVM> constexpr int per_word() { return (KVM == KV_FP8 || KVM == KV_FP8H) ? 4 : 2; }
+
+// N consecutive elements (N * sizeof(T) a multiple of 16 bytes, 16-byte aligned) -> fp32
+template <int KVM, int N> static inline void loadN(const typename KVType<KVM>::T* p, float* o) {
+    using T = typename KVType<KVM>::T;
+    constexpr int BYTES = N * (int)sizeof(T);
+    constexpr int PW = per_word<KVM>();
+    static_assert(BYTES % 16 == 0, "loadN: 16k bytes");
+#pragma unroll
+    for (int i = 0; i < BYTES / 16; ++i) {
+        const sycl::vec<uint32_t, 4> w = reinterpret_cast<const sycl::vec<uint32_t, 4>*>(p)[i];
+        dec_word<KVM>(w[0], o + (4 * i + 0) * PW);
+        dec_word<KVM>(w[1], o + (4 * i + 1) * PW);
+        dec_word<KVM>(w[2], o + (4 * i + 2) * PW);
+        dec_word<KVM>(w[3], o + (4 * i + 3) * PW);
+    }
+}
+template <int KVM> static inline float load1(const typename KVType<KVM>::T* p) {
+    if constexpr (KVM == KV_BF16) return sycl::bit_cast<float>((uint32_t)*p << 16);
+    else if constexpr (KVM == KV_FP16) return half_bits(*p);
+    else if constexpr (KVM == KV_FP8) return e4m3_exact(*p);
+    else { const uint32_t u = *p; return half_bits(((u & 0x80u) << 8) | ((u & 0x7Fu) << 7)); }
+}
+
+static inline uint16_t f2bf16_bits(float x) {
+    uint32_t u = sycl::bit_cast<uint32_t>(x);
+    u += 0x7FFFu + ((u >> 16) & 1u);   // RNE (inputs are finite)
+    return (uint16_t)(u >> 16);
+}
+
+// a 1-D device integer vector (int32 | int64, any stride); p == nullptr = absent
+struct IVec {
+    const void* p = nullptr;
+    int64_t st = 1;
+    int64_t n = 0;
+    int is64 = 0;
+};
+static inline int64_t ld(const IVec& v, int64_t i) {
+    return v.is64 ? static_cast<const int64_t*>(v.p)[i * v.st] : (int64_t)static_cast<const int32_t*>(v.p)[i * v.st];
+}
+static inline int64_t floordiv(int64_t a, int64_t b) { const int64_t q = a / b; return (a % b != 0 && ((a < 0) != (b < 0))) ? q - 1 : q; }
+
+struct DecArgs {
+    const uint16_t* q; int64_t qs0, qs1;        // bf16 bits [R, Hq, HD]
+    const void* k; int64_t ks0, ks1;            // [N, Hk, HD]
+    const void* v; int64_t vs0, vs1;
+    const int32_t* idx; int64_t is0; int W;     // [R, W]: compressed block ids (expand) or logical token ids
+    int expand, ratio, token_topk, T;           // T = cells per row (token_topk + ratio - 1 when expanding, else W)
+    IVec qpos, seqlen;                          // per row (expand only): query position, expansion length bound
+    IVec t2b;                                   // per row -> sequence id (absent: identity)
+    IVec rowlen;                                // per sequence: logical tokens < rowlen are mappable
+    IVec rreq;                                  // per sequence -> table row (absent: the sequence id)
+    const void* table; int tab64; int64_t ts0, TW, NT;   // [NT, TW] logical -> physical slot
+    float qscale;                               // softmax scale * log2(e) * kv_unscale
+    float vunscale;
+    int cpw, n_split, n_chunks;
+    uint16_t* out;                              // bf16 bits [R, Hq, HD] contiguous (n_split == 1)
+    float* pacc; float* pm; float* pl;          // split partials (n_split > 1)
+};
+
+struct RowInfo { int64_t qp, sl, trow, tlen; bool ok; };
+
+static inline RowInfo row_info(const DecArgs& a, int row) {
+    RowInfo ri{0, 0, 0, 0, false};
+    const int64_t seq = a.t2b.p ? ld(a.t2b, row) : (int64_t)row;
+    if (seq < 0 || seq >= a.rowlen.n) return ri;
+    ri.tlen = ld(a.rowlen, seq);
+    if (a.rreq.p) {
+        if (seq >= a.rreq.n) return ri;
+        ri.trow = ld(a.rreq, seq);
+    } else {
+        ri.trow = seq;
+    }
+    if (ri.trow < 0 || ri.trow >= a.NT) return ri;
+    if (a.expand) { ri.qp = ld(a.qpos, row); ri.sl = ld(a.seqlen, row); }
+    ri.ok = true;
+    return ri;
+}
+
+// physical slot of cell c of `row` (-1 = masked); torch_expand_qsa_block_indices + _logical_to_physical
+static inline int32_t cell_slot(const DecArgs& a, int row, const RowInfo& ri, int c) {
+    if (!ri.ok || c >= a.T) return -1;
+    int64_t lg;
+    if (a.expand) {
+        if (c < a.token_topk) {
+            const int64_t b = a.idx[(int64_t)row * a.is0 + c / a.ratio];
+            lg = b >= 0 ? b * a.ratio + (c % a.ratio) : -1;
+            if (lg >= ri.sl) lg = -1;
+        } else {
+            const int64_t o = c - a.token_topk;               // 0 .. ratio - 2
+            const int64_t vis = ri.qp + 1;
+            const int64_t ts = floordiv(vis, a.ratio) * a.ratio;
+            const int64_t cnt = vis - ts;
+            lg = (o < cnt && ts + o < ri.sl) ? ts + o : -1;
+        }
+    } else {
+        lg = a.idx[(int64_t)row * a.is0 + c];
+    }
+    if (lg < 0 || lg >= ri.tlen) return -1;
+    const int64_t col = lg < a.TW ? lg : a.TW - 1;           // SGLang clamps to the table width before gathering
+    const int64_t e = ri.trow * a.ts0 + col;
+    const int64_t s = a.tab64 ? static_cast<const int64_t*>(a.table)[e] : (int64_t)static_cast<const int32_t*>(a.table)[e];
+    return s >= 0 && s <= 0x7FFFFFFF ? (int32_t)s : -1;
+}
+
+// Chunk kernel. Work-group (row, kvh, split) = THREADS threads; chunk = CH cells.
+// Q.K: sub-group w scores cells cb * SG + lane (cb = w % NCB) over dimension quarter dp = w / NCB (HD / NQ dims each),
+// partial sums to SLM, summed per (head, cell) before the chunk softmax.
+template <int KVM, int SG, int CH>
+struct DecKernel {
+    static constexpr int NW = THREADS / SG;
+    static constexpr int NCB = CH / SG;          // cell blocks of SG cells
+    static constexpr int NQ = THREADS / CH;      // dimension parts
+    static constexpr int DPP = HD / NQ;          // dimensions per part
+    static constexpr int CPL = CH / SG;          // cells per lane in the softmax
+    static_assert(NW == NCB * NQ && DPP % SG == 0 && CH % 4 == 0, "layout");
+    using T = typename KVType<KVM>::T;
+    DecArgs a;
+    sycl::local_accessor<float, 2> sq;      // [G][HD] scaled q
+    sycl::local_accessor<float, 1> spp;     // [NQ][G][CH] partial scores
+    sycl::local_accessor<float, 2> sp;      // [G][CH] probabilities
+    sycl::local_accessor<int32_t, 1> srow;  // [CH] slot (-1 masked)
+    sycl::local_accessor<float, 1> sst;     // [3G] running max (log2 domain), running sum, alpha
+
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        namespace sx = sycl::ext::oneapi::experimental;
+        return sx::properties{sx::sub_group_size<SG>};
+    }
+
+    void operator()(sycl::nd_item<3> it) const {
+        const int row = it.get_group(0), kvh = it.get_group(1), split = it.get_group(2);
+        const int Hk = it.get_group_range(1);
+        const int t = it.get_local_id(2);
+        auto g = it.get_group();
+        auto sg = it.get_sub_group();
+        const int lane = sg.get_local_id()[0], warp = sg.get_group_id()[0];
+        const int cb = warp % NCB, dp = warp / NCB;
+        const RowInfo ri = row_info(a, row);
+        const uint16_t* qr = a.q + (size_t)row * a.qs0 + (size_t)(kvh * G) * a.qs1;
+        for (int i = t; i < G * HD; i += THREADS)
+            sq[i / HD][i % HD] = sycl::bit_cast<float>((uint32_t)qr[(size_t)(i / HD) * a.qs1 + (i % HD)] << 16) * a.qscale;
+        if (t < G) { sst[t] = NEG; sst[G + t] = 0.0f; sst[2 * G + t] = 1.0f; }
+        float acc[G];
+#pragma unroll
+        for (int h = 0; h < G; ++h) acc[h] = 0.0f;
+        const T* kb = static_cast<const T*>(a.k) + (size_t)kvh * a.ks1;
+        const T* vb = static_cast<const T*>(a.v) + (size_t)kvh * a.vs1;
+        const int c_beg = split * a.cpw, c_end = sycl::min(c_beg + a.cpw, a.n_chunks);
+        for (int c = c_beg; c < c_end; ++c) {
+            const int c0 = c * CH;
+            const int my = t < CH ? cell_slot(a, row, ri, c0 + t) : -1;
+            if (t < CH) srow[t] = my;
+            const int nv = sycl::reduce_over_group(g, my >= 0 ? t + 1 : 0, sycl::maximum<int>());
+            sycl::group_barrier(g);
+            if (nv == 0) continue;                            // uniform: no valid cell in this chunk
+            {   // partial scores: lane = cell cb * SG + lane, dimensions [dp * DPP, (dp + 1) * DPP)
+                const int cell = cb * SG + lane;
+                const int s = srow[cell];
+                const bool ok = s >= 0;
+                float sc[G];
+#pragma unroll
+                for (int h = 0; h < G; ++h) sc[h] = 0.0f;
+                if (sycl::any_of_group(sg, ok)) {
+                    const T* kp = kb + (size_t)(ok ? s : 0) * a.ks0;
+                    for (int db = dp * DPP; db < (dp + 1) * DPP; db += SG) {
+                        float qv[G];
+#pragma unroll
+                        for (int h = 0; h < G; ++h) qv[h] = sq[h][db + lane];
+                        float kf[SG];
+                        loadN<KVM, SG>(kp + db, kf);
+#pragma unroll
+                        for (int j = 0; j < SG; ++j) {
+#pragma unroll
+                            for (int h = 0; h < G; ++h) sc[h] = sycl::fma(kf[j], sycl::group_broadcast(sg, qv[h], j), sc[h]);
+                        }
+                    }
+                }
+#pragma unroll
+                for (int h = 0; h < G; ++h) spp[(dp * G + h) * CH + cell] = sc[h];
+            }
+            sycl::group_barrier(g);
+            for (int h = warp; h < G; h += NW) {             // chunk softmax merged into the running max / sum
+                float sv[CPL];
+                float mx = NEG;
+#pragma unroll
+                for (int j = 0; j < CPL; ++j) {
+                    const int cell = lane + j * SG;
+                    float x = 0.0f;
+#pragma unroll
+                    for (int d = 0; d < NQ; ++d) x += spp[(d * G + h) * CH + cell];
+                    sv[j] = srow[cell] >= 0 ? x : NEG;
+                    mx = sycl::fmax(mx, sv[j]);
+                }
+                mx = sycl::reduce_over_group(sg, mx, sycl::maximum<float>());
+                const float mo = sst[h];
+                const float mn = sycl::fmax(mo, mx);
+                const float alpha = mo == NEG ? 0.0f : sycl::native::exp2(mo - mn);
+                float ls = 0.0f;
+#pragma unroll
+                for (int j = 0; j < CPL; ++j) {
+                    const float p = sv[j] == NEG ? 0.0f : sycl::native::exp2(sv[j] - mn);
+                    sp[h][lane + j * SG] = p;
+                    ls += p;
+                }
+                ls = sycl::reduce_over_group(sg, ls, sycl::plus<float>());
+                if (lane == 0) { sst[G + h] = sst[G + h] * alpha + ls; sst[h] = mn; sst[2 * G + h] = alpha; }
+            }
+            sycl::group_barrier(g);
+#pragma unroll
+            for (int h = 0; h < G; ++h) acc[h] *= sst[2 * G + h];
+            for (int cc = 0; cc < nv; cc += 4) {              // P.V: thread t owns dimension t
+                float vv[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const int s = srow[cc + j];
+                    vv[j] = s >= 0 ? load1<KVM>(vb + (size_t)s * a.vs0 + t) : 0.0f;
+                }
+#pragma unroll
+                for (int h = 0; h < G; ++h) {
+                    acc[h] = sycl::fma(sp[h][cc + 0], vv[0], acc[h]);
+                    acc[h] = sycl::fma(sp[h][cc + 1], vv[1], acc[h]);
+                    acc[h] = sycl::fma(sp[h][cc + 2], vv[2], acc[h]);
+                    acc[h] = sycl::fma(sp[h][cc + 3], vv[3], acc[h]);
+                }
+            }
+            sycl::group_barrier(g);
+        }
+        if (a.n_split == 1) {
+            uint16_t* o = a.out + ((size_t)row * Hk * G + (size_t)kvh * G) * HD + t;
+#pragma unroll
+            for (int h = 0; h < G; ++h) {
+                const float L = sst[G + h];
+                o[(size_t)h * HD] = f2bf16_bits(L > 0.0f ? acc[h] * a.vunscale / L : 0.0f);
+            }
+        } else {
+            const size_t slot = ((size_t)row * Hk + kvh) * a.n_split + split;
+#pragma unroll
+            for (int h = 0; h < G; ++h) a.pacc[(slot * G + h) * HD + t] = acc[h];
+            if (t < G) { a.pm[slot * G + t] = sst[t]; a.pl[slot * G + t] = sst[G + t]; }
+        }
+    }
+};
+
+// Strata attn_merge_kernel: log-sum-exp merge of the splits of one (row, q head); thread = dimension.
+struct MergeKernel {
+    const float* pacc; const float* pm; const float* pl;
+    uint16_t* out; int n_split, Hk; float vunscale;
+    void operator()(sycl::nd_item<2> it) const {
+        const int gi = it.get_group(0);
+        const int Hq = Hk * G;
+        const int row = gi / Hq, hq = gi % Hq, kvh = hq / G, hl = hq % G;
+        const int d = it.get_local_id(1);
+        const size_t base = ((size_t)row * Hk + kvh) * n_split;
+        float M = NEG;
+        for (int s = 0; s < n_split; ++s) M = sycl::fmax(M, pm[(base + s) * G + hl]);
+        float L = 0.0f, acc = 0.0f;
+        for (int s = 0; s < n_split; ++s) {
+            const float m = pm[(base + s) * G + hl];
+            if (m == NEG) continue;
+            const float w = sycl::native::exp2(m - M);
+            L = sycl::fma(pl[(base + s) * G + hl], w, L);
+            acc = sycl::fma(pacc[((base + s) * G + hl) * HD + d], w, acc);
+        }
+        out[((size_t)row * Hq + hq) * HD + d] = f2bf16_bits(L > 0.0f ? acc * vunscale / L : 0.0f);
+    }
+};
+
+template <int KVM, int SG, int CH>
+static void submit_chunk(sycl::queue& q, const DecArgs& a, int rows, int Hk) {
+    using K = DecKernel<KVM, SG, CH>;
+    q.submit([&](sycl::handler& h) {
+        K k{a, sycl::local_accessor<float, 2>(sycl::range<2>(G, HD), h),
+            sycl::local_accessor<float, 1>(sycl::range<1>((size_t)K::NQ * G * CH), h),
+            sycl::local_accessor<float, 2>(sycl::range<2>(G, CH), h),
+            sycl::local_accessor<int32_t, 1>(sycl::range<1>(CH), h),
+            sycl::local_accessor<float, 1>(sycl::range<1>(3 * G), h)};
+        sycl::nd_range<3> nr(sycl::range<3>((size_t)rows, (size_t)Hk, (size_t)a.n_split * THREADS),
+                             sycl::range<3>(1, 1, THREADS));
+        h.parallel_for(nr, k);
+    });
+}
+
+template <int KVM, int SG>
+static bool dispatch_ch(int ch, sycl::queue& q, const DecArgs& a, int rows, int Hk) {
+    if (ch == 64) submit_chunk<KVM, SG, 64>(q, a, rows, Hk);
+    else if (ch == 128) submit_chunk<KVM, SG, 128>(q, a, rows, Hk);
+    else if (ch == 256) submit_chunk<KVM, SG, 256>(q, a, rows, Hk);
+    else return false;
+    return true;
+}
+
+template <int KVM>
+static bool dispatch_sg(int sg, int ch, sycl::queue& q, const DecArgs& a, int rows, int Hk) {
+    if (sg == 16) return dispatch_ch<KVM, 16>(ch, q, a, rows, Hk);
+    if (sg == 32) return dispatch_ch<KVM, 32>(ch, q, a, rows, Hk);
+    return false;
+}
+
+static bool dispatch(int kvm, int sg, int ch, sycl::queue& q, const DecArgs& a, int rows, int Hk) {
+    switch (kvm) {
+        case KV_BF16: return dispatch_sg<KV_BF16>(sg, ch, q, a, rows, Hk);
+        case KV_FP16: return dispatch_sg<KV_FP16>(sg, ch, q, a, rows, Hk);
+        case KV_FP8: return dispatch_sg<KV_FP8>(sg, ch, q, a, rows, Hk);
+        default: return dispatch_sg<KV_FP8H>(sg, ch, q, a, rows, Hk);
+    }
+}
+
+// launch geometry: cells per row, chunks, chunks per work-group, splits. cpw <= 0: auto (about target_wg
+// work-groups over rows x Hk x splits, at least one chunk per split).
+static inline void geometry(DecArgs& a, int rows, int Hk, int ch, int cpw, int target_wg) {
+    a.n_chunks = (a.T + ch - 1) / ch;
+    if (a.n_chunks < 1) a.n_chunks = 1;
+    int c = cpw;
+    if (c <= 0) {
+        const int tw = target_wg > 0 ? target_wg : 160;
+        const int want = std::max(1, (tw + rows * Hk - 1) / (rows * Hk));   // splits wanted per (row, kv head)
+        c = std::max(1, (a.n_chunks + want - 1) / want);
+    }
+    if (c > a.n_chunks) c = a.n_chunks;
+    a.cpw = c;
+    a.n_split = (a.n_chunks + c - 1) / c;
+}
+
+// floats of split scratch needed
+static inline int64_t scratch_floats(const DecArgs& a, int rows, int Hk) {
+    return a.n_split > 1 ? (int64_t)rows * Hk * a.n_split * G * (HD + 2) : 0;
+}
+
+// host-side launcher shared by the torch op and the CPU test. scratch: scratch_floats() floats (or null when 1 split).
+static bool launch(sycl::queue& q, DecArgs a, int rows, int Hk, int kvm, int sg, int ch, float* scratch) {
+    if (a.n_split > 1) {
+        const int64_t n = (int64_t)rows * Hk * a.n_split * G;
+        a.pacc = scratch;
+        a.pm = scratch + n * HD;
+        a.pl = a.pm + n;
+    }
+    if (!dispatch(kvm, sg, ch, q, a, rows, Hk)) return false;
+    if (a.n_split > 1) {
+        MergeKernel mk{a.pacc, a.pm, a.pl, a.out, a.n_split, Hk, a.vunscale};
+        const int Hq = Hk * G;
+        q.submit([&](sycl::handler& h) {
+            h.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t)rows * Hq, HD), sycl::range<2>(1, HD)), mk);
+        });
+    }
+    return true;
+}
+
+#ifndef N114_NO_TORCH
+static sycl::queue& queue_of(const at::Tensor& t) { return c10::xpu::getCurrentXPUStream(t.device().index()).queue(); }
+
+static IVec ivec(const std::optional<at::Tensor>& t, const char* name, const at::Tensor& ref) {
+    IVec v;
+    if (!t.has_value() || !t->defined()) return v;
+    const at::Tensor& x = *t;
+    TORCH_CHECK(x.device() == ref.device(), "n114qsa.decode_attn: ", name, " device");
+    TORCH_CHECK(x.dim() == 1 || (x.dim() == 2 && x.size(1) == 1), "n114qsa.decode_attn: ", name, " must be 1-D");
+    TORCH_CHECK(x.scalar_type() == at::kInt || x.scalar_type() == at::kLong, "n114qsa.decode_attn: ", name, " int32|int64");
+    v.p = x.data_ptr();
+    v.st = x.stride(0);
+    v.n = x.size(0);
+    v.is64 = x.scalar_type() == at::kLong;
+    return v;
+}
+
+// q [R, Hq, 256] bf16 (inner stride 1); k, v [N, Hk, 256] fp8_e4m3fn | bf16 | fp16 (16-byte aligned rows);
+// idx [R, W] int32: expand -> compressed block ids (W * ratio >= token_topk), else logical token ids;
+// qpos, seqlen [R] (expand): query positions and expansion bound (sequence lengths per row);
+// t2b [R] row -> sequence (None: identity); rowlen [S] logical bound per sequence; rreq [S] sequence -> table row
+// (None: identity); table [NT, TW] int32 | int64 logical -> physical slot.
+// chunk 64 | 128 | 256 cells; cpw chunks per work-group (<= 0 auto, ~target_wg work-groups); sg 16 | 32;
+// fp8_mode 0 exact | 1 via fp16. Returns [R, Hq, 256] bf16.
+at::Tensor decode_attn(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor idx,
+                       const std::optional<at::Tensor>& qpos, const std::optional<at::Tensor>& seqlen,
+                       const std::optional<at::Tensor>& t2b, at::Tensor rowlen, const std::optional<at::Tensor>& rreq,
+                       at::Tensor table, double scale, int64_t ratio, int64_t token_topk, bool expand, int64_t chunk,
+                       int64_t cpw, int64_t sg, int64_t fp8_mode, int64_t target_wg) {
+    TORCH_CHECK(q.is_xpu() && k.is_xpu() && v.is_xpu() && idx.is_xpu() && rowlen.is_xpu() && table.is_xpu(),
+                "n114qsa.decode_attn: XPU tensors");
+    TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3 && idx.dim() == 2 && table.dim() == 2,
+                "n114qsa.decode_attn: ranks");
+    TORCH_CHECK(q.scalar_type() == at::kBFloat16, "n114qsa.decode_attn: q must be bf16");
+    TORCH_CHECK(idx.scalar_type() == at::kInt && idx.stride(1) == 1, "n114qsa.decode_attn: idx int32, inner stride 1");
+    TORCH_CHECK(table.scalar_type() == at::kInt || table.scalar_type() == at::kLong, "n114qsa.decode_attn: table int32|int64");
+    TORCH_CHECK(table.stride(1) == 1, "n114qsa.decode_attn: table inner stride 1");
+    const int64_t R = q.size(0), Hq = q.size(1), Hk = k.size(1);
+    TORCH_CHECK(q.size(2) == HD && k.size(2) == HD && v.size(2) == HD && v.size(1) == Hk && v.size(0) == k.size(0),
+                "n114qsa.decode_attn: head_dim 256, k/v shapes");
+    TORCH_CHECK(Hq == G * Hk, "n114qsa.decode_attn: Hq must be 12 * Hk");
+    TORCH_CHECK(idx.size(0) == R, "n114qsa.decode_attn: idx rows");
+    TORCH_CHECK(q.stride(2) == 1 && k.stride(2) == 1 && v.stride(2) == 1, "n114qsa.decode_attn: inner strides");
+    TORCH_CHECK(k.scalar_type() == v.scalar_type(), "n114qsa.decode_attn: k/v dtype");
+    TORCH_CHECK(chunk == 64 || chunk == 128 || chunk == 256, "n114qsa.decode_attn: chunk 64|128|256");
+    TORCH_CHECK(sg == 16 || sg == 32, "n114qsa.decode_attn: sg 16|32");
+    TORCH_CHECK(R < (1 << 20), "n114qsa.decode_attn: rows");
+    int kvm;
+    const auto kd = k.scalar_type();
+    if (kd == at::kBFloat16) kvm = KV_BF16;
+    else if (kd == at::kHalf) kvm = KV_FP16;
+    else if (kd == at::kFloat8_e4m3fn) kvm = fp8_mode == 1 ? KV_FP8H : KV_FP8;
+    else TORCH_CHECK(false, "n114qsa.decode_attn: k/v dtype must be fp8_e4m3fn, bf16 or fp16");
+    const int64_t al = 16 / k.element_size();
+    TORCH_CHECK(k.stride(0) % al == 0 && k.stride(1) % al == 0 && v.stride(0) % al == 0 && v.stride(1) % al == 0 &&
+                reinterpret_cast<uintptr_t>(k.data_ptr()) % 16 == 0 && reinterpret_cast<uintptr_t>(v.data_ptr()) % 16 == 0,
+                "n114qsa.decode_attn: K/V rows must be 16-byte aligned");
+    DecArgs a{};
+    a.expand = expand ? 1 : 0;
+    a.W = (int)idx.size(1);
+    if (expand) {
+        TORCH_CHECK(ratio >= 1 && token_topk >= 1 && (int64_t)a.W * ratio >= token_topk,
+                    "n114qsa.decode_attn: block width * ratio must cover token_topk");
+        a.qpos = ivec(qpos, "qpos", q);
+        a.seqlen = ivec(seqlen, "seqlen", q);
+        TORCH_CHECK(a.qpos.p && a.seqlen.p && a.qpos.n == R && a.seqlen.n == R, "n114qsa.decode_attn: qpos/seqlen [R]");
+        a.ratio = (int)ratio; a.token_topk = (int)token_topk;
+        a.T = (int)(token_topk + ratio - 1);
+    } else {
+        a.ratio = 1; a.token_topk = a.W;
+        a.T = a.W;
+    }
+    a.t2b = ivec(t2b, "t2b", q);
+    TORCH_CHECK(!a.t2b.p || a.t2b.n == R, "n114qsa.decode_attn: t2b [R]");
+    a.rowlen = ivec(std::optional<at::Tensor>(rowlen), "rowlen", q);
+    a.rreq = ivec(rreq, "rreq", q);
+    a.table = table.data_ptr(); a.tab64 = table.scalar_type() == at::kLong;
+    a.ts0 = table.stride(0); a.TW = table.size(1); a.NT = table.size(0);
+    auto out = at::empty({R, Hq, HD}, q.options());
+    if (R == 0) return out;
+    if (a.T == 0 || a.TW == 0) { out.zero_(); return out; }
+    a.q = reinterpret_cast<const uint16_t*>(q.data_ptr()); a.qs0 = q.stride(0); a.qs1 = q.stride(1);
+    a.k = k.data_ptr(); a.ks0 = k.stride(0); a.ks1 = k.stride(1);
+    a.v = v.data_ptr(); a.vs0 = v.stride(0); a.vs1 = v.stride(1);
+    a.idx = idx.data_ptr<int32_t>(); a.is0 = idx.stride(0);
+    const float vun = kvm == KV_FP8H ? 256.0f : 1.0f;
+    a.qscale = (float)scale * LOG2E * vun;
+    a.vunscale = vun;
+    a.out = reinterpret_cast<uint16_t*>(out.data_ptr());
+    geometry(a, (int)R, (int)Hk, (int)chunk, (int)cpw, (int)target_wg);
+    at::Tensor scratch;
+    float* sp = nullptr;
+    const int64_t nf = scratch_floats(a, (int)R, (int)Hk);
+    if (nf > 0) {
+        scratch = at::empty({nf}, q.options().dtype(at::kFloat));
+        sp = scratch.data_ptr<float>();
+    }
+    TORCH_CHECK(launch(queue_of(q), a, (int)R, (int)Hk, kvm, (int)sg, (int)chunk, sp),
+                "n114qsa.decode_attn: unsupported config");
+    return out;
+}
+
+// the launch geometry the op would use: [n_chunks, cpw, n_split, cells per row]
+std::vector<int64_t> geometry_of(int64_t rows, int64_t hk, int64_t cells, int64_t chunk, int64_t cpw, int64_t target_wg) {
+    DecArgs a{};
+    a.T = (int)cells;
+    geometry(a, (int)rows, (int)hk, (int)chunk, (int)cpw, (int)target_wg);
+    return {a.n_chunks, a.cpw, a.n_split, a.T};
+}
+#endif  // N114_NO_TORCH
+}  // namespace n114q
+
+#ifndef N114_NO_TORCH
+TORCH_LIBRARY(n114qsa, m) {
+    m.def("decode_attn(Tensor q, Tensor k, Tensor v, Tensor idx, Tensor? qpos, Tensor? seqlen, Tensor? t2b, "
+          "Tensor rowlen, Tensor? rreq, Tensor table, float scale, int ratio, int token_topk, bool expand, int chunk, "
+          "int cpw, int sg, int fp8_mode, int target_wg) -> Tensor");
+    m.impl("decode_attn", torch::kXPU, &n114q::decode_attn);
+    m.def("geometry(int rows, int hk, int cells, int chunk, int cpw, int target_wg) -> int[]", &n114q::geometry_of);
+}
+#endif

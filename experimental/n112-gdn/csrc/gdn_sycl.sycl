@@ -1,0 +1,346 @@
+// N112: token-serial FP32 gated delta-net (GDN) prompt recurrence for Intel Xe2 (Arc Pro B70) as a torch XPU op
+// library (torch.ops.n112gdn.*). Drop-in for SGLang's chunk_gated_delta_rule extend call (Qwen3.8-Flash-Next linear
+// attention layers): same inputs (q, k, v, g, beta, state pool + slot indices, cu_seqlens), same outputs (o, and the
+// final recurrent state written back in place to the pool).
+//
+// Port of Strata's gdn_rec_cols_pipe_kernel (sycl/src/prefill/kernels.dp.cpp of github.com/Niko1221/Strata,
+// HEAD 82f46a8): one work-group per (sequence, value head, block of value columns), each thread keeps a slice of its
+// column's FP32 state in registers for the whole prompt, the next token's inputs are fetched while the current token
+// computes. Adapted to SGLang:
+//   * state pool [slots, H, V, K] (fp32, or bf16) indexed by the per-sequence slot (slot < 0: zero initial state and
+//     no write-back, like the Triton kernel); value row v of head h is contiguous over k;
+//   * varlen batches through cu_seqlens (device, no host sync), GQA head map hk = h / (H / Hk);
+//   * q / k / v bf16 read in place from strided views of the conv output (no contiguous copies);
+//   * q / k L2 normalisation (use_qk_l2norm_in_kernel) as per-(token, key head) inverse norms from a prepass, folded
+//     into the recurrence: kv = rk * (S . k), S = e^g S + k (rk * beta * (v - e^g kv)), o = rq * scale * (S . q);
+//   * the reductions over k run across the RG lanes that share a column (adjacent lanes of one sub-group) with
+//     sub-group shuffles: no shared local memory and no work-group barrier in the token loop.
+// Precision: fp32 state, products and accumulation; o rounded once to bf16 (RNE). The Triton chunk path rounds the
+// normalised q / k, the WY factors and the per-chunk state to bf16, so this kernel is at least as close to an
+// fp64 token-serial reference (test_gdn_xpu.py measures both).
+//
+// ---------------------------------------------------------------------------------------------------------------
+// Portions derived from Strata:
+//
+// MIT License
+//
+// Copyright (c) 2026 Niko1221 and the Strata contributors
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// ---------------------------------------------------------------------------------------------------------------
+
+#ifndef N112_NO_TORCH          // csrc/cpu_test.cpp includes this file without torch (OpenCL CPU device)
+#include <torch/all.h>
+#include <torch/library.h>
+#include <c10/xpu/XPUStream.h>
+#endif
+#include <sycl/sycl.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+
+#include <cstdint>
+
+namespace n112 {
+
+constexpr int KD = 128;   // key head dim
+constexpr int VD = 128;   // value head dim
+constexpr int SG = 16;    // sub-group size
+
+struct alignas(16) U4 { uint32_t x[4]; };
+
+static inline float lo_bf(uint32_t w) { return sycl::bit_cast<float>(w << 16); }
+static inline float hi_bf(uint32_t w) { return sycl::bit_cast<float>(w & 0xffff0000u); }
+static inline uint16_t f2bf(float f) {
+    uint32_t u = sycl::bit_cast<uint32_t>(f);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (uint16_t)(u >> 16);
+}
+
+struct RecArgs {
+    const uint16_t* q; const uint16_t* k; const uint16_t* v;   // bf16 bits
+    int64_t qst, qsh, kst, ksh, vst, vsh;                         // token / head strides (elements)
+    const float* g; const float* beta; int64_t gst, bst;         // [T, H] (head stride 1)
+    const float* rn;                                              // [2][T][Hk] inverse l2 norms (q, k); null = none
+    int64_t T;
+    void* state; int64_t sss;                                     // pool [slots, H, V, K]; slot stride (elements)
+    const int32_t* idx; const int32_t* cu;                        // [N] slots, [N + 1] cu_seqlens
+    uint16_t* o;                                                  // [T, H, V] bf16 bits
+    int H, Hk;
+    float scale;
+};
+
+template <bool BF> struct StateIO;
+template <> struct StateIO<false> {
+    static inline float ld(const void* p, int64_t i) { return static_cast<const float*>(p)[i]; }
+    static inline void st(void* p, int64_t i, float x) { static_cast<float*>(p)[i] = x; }
+};
+template <> struct StateIO<true> {
+    static inline float ld(const void* p, int64_t i) { return sycl::bit_cast<float>((uint32_t)static_cast<const uint16_t*>(p)[i] << 16); }
+    static inline void st(void* p, int64_t i, float x) { static_cast<uint16_t*>(p)[i] = f2bf(x); }
+};
+
+// Work-group = CB value columns x RG row groups; lane (local id) l: rg = l % RG, column = cb * CB + l / RG.
+// Each thread owns RPT = 128 / RG consecutive k entries of its column's state row.
+template <int RG, int CB, bool SBF, bool BIG>
+struct RecKernel {
+    RecArgs a;
+
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        namespace sx = sycl::ext::oneapi::experimental;
+        if constexpr (BIG) return sx::properties{sycl::ext::intel::experimental::grf_size<256>, sx::sub_group_size<SG>};
+        else return sx::properties{sx::sub_group_size<SG>};
+    }
+
+    void operator()(sycl::nd_item<1> it) const {
+        constexpr int RPT = KD / RG;   // state floats per thread
+        constexpr int NV = RPT / 8;    // 16-byte loads per thread per q / k row slice
+        constexpr int NCB = VD / CB;
+        static_assert(RPT % 8 == 0 && SG % RG == 0, "layout");
+        const int gid = (int)it.get_group(0);
+        const int hn = a.H * NCB;
+        const int n = gid / hn, rem = gid - n * hn;
+        const int h = rem / NCB, cb = rem - h * NCB;
+        const int lid = (int)it.get_local_id(0);
+        const int rg = lid % RG, col = cb * CB + lid / RG;
+        const int hk = h / (a.H / a.Hk);
+        const int bos = a.cu[n], eos = a.cu[n + 1];
+        const int slot = a.idx[n];
+        if (eos <= bos) return;   // uniform over the work-group; the state stays as it is (Triton: no write either)
+        auto sg = it.get_sub_group();
+
+        float s[RPT];
+        const int64_t soff = (int64_t)slot * a.sss + ((int64_t)h * VD + col) * KD + rg * RPT;
+        if (slot >= 0) {
+#pragma unroll
+            for (int r = 0; r < RPT; ++r) s[r] = StateIO<SBF>::ld(a.state, soff + r);
+        } else {
+#pragma unroll
+            for (int r = 0; r < RPT; ++r) s[r] = 0.0f;
+        }
+
+        const int64_t qoff = (int64_t)hk * a.qsh + rg * RPT;
+        const int64_t koff = (int64_t)hk * a.ksh + rg * RPT;
+        const int64_t voff = (int64_t)h * a.vsh + col;
+        U4 nq[NV], nk[NV];
+        float nv = 0.0f, ng = 0.0f, nb = 0.0f, nrq = 1.0f, nrk = 1.0f;
+        auto fetch = [&](int t) {
+            const U4* qp = reinterpret_cast<const U4*>(a.q + (int64_t)t * a.qst + qoff);
+            const U4* kp = reinterpret_cast<const U4*>(a.k + (int64_t)t * a.kst + koff);
+#pragma unroll
+            for (int u = 0; u < NV; ++u) { nk[u] = kp[u]; nq[u] = qp[u]; }
+            nv = sycl::bit_cast<float>((uint32_t)a.v[(int64_t)t * a.vst + voff] << 16);
+            ng = a.g[(int64_t)t * a.gst + h];
+            nb = a.beta[(int64_t)t * a.bst + h];
+            if (a.rn) {
+                nrq = a.rn[(int64_t)t * a.Hk + hk];
+                nrk = a.rn[(a.T + t) * a.Hk + hk];
+            }
+        };
+        fetch(bos);
+        for (int t = bos; t < eos; ++t) {
+            U4 cq[NV], ck[NV];
+#pragma unroll
+            for (int u = 0; u < NV; ++u) { cq[u] = nq[u]; ck[u] = nk[u]; }
+            const float cv = nv, cg = ng, cbeta = nb, crq = nrq, crk = nrk;
+            if (t + 1 < eos) fetch(t + 1);
+            const float dec = sycl::exp(cg);
+            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+#pragma unroll
+            for (int u = 0; u < NV; ++u) {
+                const int r = u * 8;
+                a0 = sycl::fma(s[r + 0], lo_bf(ck[u].x[0]), a0); a1 = sycl::fma(s[r + 1], hi_bf(ck[u].x[0]), a1);
+                a2 = sycl::fma(s[r + 2], lo_bf(ck[u].x[1]), a2); a3 = sycl::fma(s[r + 3], hi_bf(ck[u].x[1]), a3);
+                a0 = sycl::fma(s[r + 4], lo_bf(ck[u].x[2]), a0); a1 = sycl::fma(s[r + 5], hi_bf(ck[u].x[2]), a1);
+                a2 = sycl::fma(s[r + 6], lo_bf(ck[u].x[3]), a2); a3 = sycl::fma(s[r + 7], hi_bf(ck[u].x[3]), a3);
+            }
+            float kv = (a0 + a1) + (a2 + a3);
+#pragma unroll
+            for (int m = 1; m < RG; m <<= 1) kv += sycl::permute_group_by_xor(sg, kv, m);
+            const float d = (cv - dec * (kv * crk)) * cbeta * crk;
+            float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+#pragma unroll
+            for (int u = 0; u < NV; ++u) {
+                const int r = u * 8;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const uint32_t kw = ck[u].x[j], qw = cq[u].x[j];
+                    s[r + 2 * j] = sycl::fma(dec, s[r + 2 * j], lo_bf(kw) * d);
+                    s[r + 2 * j + 1] = sycl::fma(dec, s[r + 2 * j + 1], hi_bf(kw) * d);
+                    if (j & 1) { o1 = sycl::fma(s[r + 2 * j], lo_bf(qw), o1); o3 = sycl::fma(s[r + 2 * j + 1], hi_bf(qw), o3); }
+                    else { o0 = sycl::fma(s[r + 2 * j], lo_bf(qw), o0); o2 = sycl::fma(s[r + 2 * j + 1], hi_bf(qw), o2); }
+                }
+            }
+            float o = (o0 + o1) + (o2 + o3);
+#pragma unroll
+            for (int m = 1; m < RG; m <<= 1) o += sycl::permute_group_by_xor(sg, o, m);
+            if (rg == 0) a.o[((int64_t)t * a.H + h) * VD + col] = f2bf(o * crq * a.scale);
+        }
+        if (slot >= 0) {
+#pragma unroll
+            for (int r = 0; r < RPT; ++r) StateIO<SBF>::st(a.state, soff + r, s[r]);
+        }
+    }
+};
+
+// inverse L2 norms of every (token, key head) row of q and k: rn[0][t][hk] = 1 / sqrt(|q|^2 + eps), rn[1] for k.
+// One sub-group per row, 8 bf16 per lane.
+struct NormKernel {
+    const uint16_t* q; const uint16_t* k;
+    int64_t qst, qsh, kst, ksh, T;
+    int Hk;
+    float eps;
+    float* rn;
+
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        namespace sx = sycl::ext::oneapi::experimental;
+        return sx::properties{sx::sub_group_size<SG>};
+    }
+
+    void operator()(sycl::nd_item<1> it) const {
+        auto sg = it.get_sub_group();
+        const int64_t row = (int64_t)it.get_global_id(0) / SG;
+        const int lane = (int)sg.get_local_id()[0];
+        const int64_t nrow = 2 * T * Hk;
+        if (row >= nrow) return;   // uniform over the sub-group
+        const int64_t which = row / (T * Hk), r = row - which * T * Hk;
+        const int64_t t = r / Hk, hk = r - t * Hk;
+        const uint16_t* p = which ? k + t * kst + hk * ksh : q + t * qst + hk * qsh;
+        const U4 w = reinterpret_cast<const U4*>(p)[lane];
+        float ss = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float x0 = lo_bf(w.x[j]), x1 = hi_bf(w.x[j]);
+            ss = sycl::fma(x0, x0, ss);
+            ss = sycl::fma(x1, x1, ss);
+        }
+        ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
+        if (lane == 0) rn[row] = 1.0f / sycl::sqrt(ss + eps);
+    }
+};
+
+template <int RG, int CB, bool SBF, bool BIG>
+static void submit_rec(sycl::queue& qu, const RecArgs& a, int64_t nseq) {
+    constexpr int NCB = VD / CB;
+    const size_t groups = (size_t)nseq * a.H * NCB;
+    RecKernel<RG, CB, SBF, BIG> kern{a};
+    qu.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(groups * RG * CB), sycl::range<1>(RG * CB)), kern);
+    });
+}
+
+static void submit_norm(sycl::queue& qu, const NormKernel& nk) {
+    const int64_t rows = 2 * nk.T * nk.Hk;
+    const int64_t wg = 256;
+    const int64_t glob = ((rows * SG + wg - 1) / wg) * wg;
+    qu.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)glob), sycl::range<1>((size_t)wg)), nk);
+    });
+}
+
+template <int RG, int CB>
+static void dispatch_rec(bool sbf, bool big, sycl::queue& qu, const RecArgs& a, int64_t nseq) {
+    if (sbf) { if (big) submit_rec<RG, CB, true, true>(qu, a, nseq); else submit_rec<RG, CB, true, false>(qu, a, nseq); }
+    else { if (big) submit_rec<RG, CB, false, true>(qu, a, nseq); else submit_rec<RG, CB, false, false>(qu, a, nseq); }
+}
+
+static bool dispatch_cfg(int64_t rg, int64_t cb, bool sbf, bool big, sycl::queue& qu, const RecArgs& a, int64_t N) {
+    if (rg == 4 && cb == 32) dispatch_rec<4, 32>(sbf, big, qu, a, N);
+    else if (rg == 4 && cb == 16) dispatch_rec<4, 16>(sbf, big, qu, a, N);
+    else if (rg == 8 && cb == 16) dispatch_rec<8, 16>(sbf, big, qu, a, N);
+    else if (rg == 8 && cb == 32) dispatch_rec<8, 32>(sbf, big, qu, a, N);
+    else if (rg == 2 && cb == 64) dispatch_rec<2, 64>(sbf, big, qu, a, N);
+    else if (rg == 2 && cb == 32) dispatch_rec<2, 32>(sbf, big, qu, a, N);
+    else return false;
+    return true;
+}
+
+#ifndef N112_NO_TORCH
+static sycl::queue& queue_of(const at::Tensor& t) { return c10::xpu::getCurrentXPUStream(t.device().index()).queue(); }
+
+static bool aligned16(const at::Tensor& t, int64_t s0, int64_t s1) {
+    return reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0 && s0 % 8 == 0 && s1 % 8 == 0;
+}
+
+// q, k [T, Hk, 128] bf16; v [T, H, 128] bf16 (inner stride 1, token / head strides multiples of 8, 16-byte aligned);
+// g, beta [T, H] fp32 (head stride 1); state [slots, H, 128, 128] fp32 | bf16 (inner three dims contiguous), updated in
+// place for slot >= 0; idx [N] int32; cu [N + 1] int32. Returns o [T, H, 128] bf16.
+// cfg: rg (row groups: 2 | 4 | 8), cb (columns per work-group), grf 128 | 256.
+at::Tensor gdn_prefill(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor g, at::Tensor beta, at::Tensor state,
+                       at::Tensor idx, at::Tensor cu, double scale, bool l2, double eps, int64_t rg, int64_t cb,
+                       int64_t grf) {
+    TORCH_CHECK(q.is_xpu() && k.is_xpu() && v.is_xpu() && g.is_xpu() && beta.is_xpu() && state.is_xpu() &&
+                idx.is_xpu() && cu.is_xpu(), "n112gdn.prefill: XPU tensors");
+    TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3 && g.dim() == 2 && beta.dim() == 2 && state.dim() == 4,
+                "n112gdn.prefill: ranks");
+    TORCH_CHECK(q.scalar_type() == at::kBFloat16 && k.scalar_type() == at::kBFloat16 && v.scalar_type() == at::kBFloat16,
+                "n112gdn.prefill: q/k/v bf16");
+    TORCH_CHECK(g.scalar_type() == at::kFloat && beta.scalar_type() == at::kFloat, "n112gdn.prefill: g/beta fp32");
+    TORCH_CHECK(state.scalar_type() == at::kFloat || state.scalar_type() == at::kBFloat16, "n112gdn.prefill: state fp32|bf16");
+    TORCH_CHECK(idx.scalar_type() == at::kInt && cu.scalar_type() == at::kInt && idx.is_contiguous() && cu.is_contiguous(),
+                "n112gdn.prefill: idx/cu int32 contiguous");
+    const int64_t T = q.size(0), Hk = q.size(1), H = v.size(1), N = idx.size(0);
+    TORCH_CHECK(cu.size(0) == N + 1, "n112gdn.prefill: cu size");
+    TORCH_CHECK(q.size(2) == KD && k.size(2) == KD && v.size(2) == VD && k.size(1) == Hk && k.size(0) == T && v.size(0) == T,
+                "n112gdn.prefill: shapes");
+    TORCH_CHECK(Hk > 0 && H % Hk == 0, "n112gdn.prefill: H % Hk");
+    TORCH_CHECK(g.size(0) == T && g.size(1) == H && beta.size(0) == T && beta.size(1) == H && g.stride(1) == 1 &&
+                beta.stride(1) == 1, "n112gdn.prefill: g/beta [T, H]");
+    TORCH_CHECK(state.size(1) == H && state.size(2) == VD && state.size(3) == KD && state.stride(3) == 1 &&
+                state.stride(2) == KD && state.stride(1) == VD * KD, "n112gdn.prefill: state [S, H, 128, 128]");
+    TORCH_CHECK(q.stride(2) == 1 && k.stride(2) == 1 && v.stride(2) == 1, "n112gdn.prefill: inner strides");
+    TORCH_CHECK(aligned16(q, q.stride(0), q.stride(1)) && aligned16(k, k.stride(0), k.stride(1)),
+                "n112gdn.prefill: q/k rows must be 16-byte aligned");
+    TORCH_CHECK(T < (int64_t)1 << 31, "n112gdn.prefill: T");
+    auto o = at::empty({T, H, VD}, q.options());
+    if (T == 0 || N == 0) return o;
+    auto& qu = queue_of(q);
+    at::Tensor rn;
+    RecArgs a{};
+    if (l2) {
+        rn = at::empty({2, T, Hk}, q.options().dtype(at::kFloat));
+        NormKernel nk{reinterpret_cast<const uint16_t*>(q.data_ptr()), reinterpret_cast<const uint16_t*>(k.data_ptr()),
+                      q.stride(0), q.stride(1), k.stride(0), k.stride(1), T, (int)Hk, (float)eps, rn.data_ptr<float>()};
+        submit_norm(qu, nk);
+        a.rn = rn.data_ptr<float>();
+    }
+    a.q = reinterpret_cast<const uint16_t*>(q.data_ptr()); a.qst = q.stride(0); a.qsh = q.stride(1);
+    a.k = reinterpret_cast<const uint16_t*>(k.data_ptr()); a.kst = k.stride(0); a.ksh = k.stride(1);
+    a.v = reinterpret_cast<const uint16_t*>(v.data_ptr()); a.vst = v.stride(0); a.vsh = v.stride(1);
+    a.g = g.data_ptr<float>(); a.gst = g.stride(0);
+    a.beta = beta.data_ptr<float>(); a.bst = beta.stride(0);
+    a.T = T;
+    a.state = state.data_ptr(); a.sss = state.stride(0);
+    a.idx = idx.data_ptr<int32_t>(); a.cu = cu.data_ptr<int32_t>();
+    a.o = reinterpret_cast<uint16_t*>(o.data_ptr());
+    a.H = (int)H; a.Hk = (int)Hk; a.scale = (float)scale;
+    const bool sbf = state.scalar_type() == at::kBFloat16;
+    const bool big = grf == 256;
+    TORCH_CHECK(dispatch_cfg(rg, cb, sbf, big, qu, a, N), "n112gdn.prefill: unsupported (rg, cb) ", rg, ",", cb);
+    return o;
+}
+
+#endif  // N112_NO_TORCH
+}  // namespace n112
+
+#ifndef N112_NO_TORCH
+TORCH_LIBRARY(n112gdn, m) {
+    m.def("prefill(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor(a!) state, Tensor idx, Tensor cu, "
+          "float scale, bool l2, float eps, int rg, int cb, int grf) -> Tensor");
+    m.impl("prefill", torch::kXPU, &n112::gdn_prefill);
+}
+#endif

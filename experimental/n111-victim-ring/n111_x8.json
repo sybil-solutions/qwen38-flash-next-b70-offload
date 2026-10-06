@@ -1,0 +1,66 @@
+{
+ "meta": {
+  "lib": "/pkg/exl3xpu/_moe_a8.so",
+  "ring_lib": false,
+  "device": "Intel(R) Arc(TM) Pro B70 Graphics",
+  "gold_load_s": 0.8,
+  "decode_traces": {
+   "C0": 5135,
+   "C1": 3446,
+   "C2": 8089,
+   "C3": 2612,
+   "C4": 5072,
+   "C5": 2442,
+   "C6": 16230,
+   "C7": 1757,
+   "L1_modelcard_summary": 2079,
+   "L2_offload_cache_code_review": 4565,
+   "L3_research_summary": 4065,
+   "L4_freetoken_docs_qa": 2759,
+   "P0": 1768,
+   "P1": 878,
+   "P2": 4716,
+   "P3": 1584,
+   "P4": 2206,
+   "P5": 1114,
+   "P6": 3331,
+   "P7": 1665,
+   "P8": 1184,
+   "P9": 2114
+  },
+  "total_s": 12.8
+ },
+ "exact": [
+  {
+   "mode": "plain",
+   "calls": 72,
+   "gold_exact": 72,
+   "victims": 396,
+   "wb_page_ok": 0,
+   "wb_flag_ok": 0,
+   "ring_slot_ok": 0,
+   "ring_flag_untouched": 0,
+   "ring_page_untouched": 0,
+   "ring_meta_ok": 0,
+   "fills_ok": 7,
+   "t": 12.8
+  },
+  {
+   "mode": "wb",
+   "calls": 72,
+   "gold_exact": 72,
+   "victims": 396,
+   "wb_page_ok": 396,
+   "wb_flag_ok": 396,
+   "ring_slot_ok": 0,
+   "ring_flag_untouched": 0,
+   "ring_page_untouched": 0,
+   "ring_meta_ok": 0,
+   "fills_ok": 6,
+   "equal_to_plain": true,
+   "t": 12.8
+  }
+ ],
+ "sim": [],
+ "bench": []
+}

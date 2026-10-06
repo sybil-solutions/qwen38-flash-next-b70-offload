@@ -1,0 +1,16 @@
+{"case": "usm", "rep": 0, "issue_ms": 1.36, "total_ms": 7.55, "ok": true}
+{"case": "usm", "rep": 1, "issue_ms": 0.19, "total_ms": 6.31, "ok": true}
+{"case": "usm", "rep": 2, "issue_ms": 0.18, "total_ms": 6.32, "ok": true}
+{"case": "memfd_warm", "rep": 0, "issue_ms": 12.39, "total_ms": 12.4, "ok": true}
+{"case": "memfd_warm", "rep": 1, "issue_ms": 9.35, "total_ms": 9.36, "ok": true}
+{"case": "memfd_warm", "rep": 2, "issue_ms": 9.44, "total_ms": 9.45, "ok": true}
+{"case": "memfd_punched", "rep": 0, "issue_ms": 13.35, "total_ms": 13.36, "ok": true}
+{"case": "memfd_punched", "rep": 1, "issue_ms": 14.75, "total_ms": 14.75, "ok": true}
+{"case": "memfd_punched", "rep": 2, "issue_ms": 12.31, "total_ms": 12.32, "ok": true}
+{"case": "usm", "rep": 0, "issue_ms": 0.19, "total_ms": 6.29, "ok": true}
+{"case": "usm", "rep": 1, "issue_ms": 0.18, "total_ms": 6.28, "ok": true}
+{"case": "usm", "rep": 2, "issue_ms": 0.17, "total_ms": 6.29, "ok": true}
+{"case": "memfd_punched", "rep": 0, "issue_ms": 12.39, "total_ms": 12.4, "ok": true}
+{"case": "memfd_punched", "rep": 1, "issue_ms": 12.24, "total_ms": 12.25, "ok": true}
+{"case": "memfd_punched", "rep": 2, "issue_ms": 12.33, "total_ms": 12.34, "ok": true}
+docker rc=0

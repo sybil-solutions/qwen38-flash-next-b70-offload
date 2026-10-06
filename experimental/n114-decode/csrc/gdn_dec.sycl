@@ -1,0 +1,458 @@
+// N114: fused gated delta-net (GDN) DECODE kernels for Intel Xe2 (Arc Pro B70) as a torch XPU op library
+// (torch.ops.n114gdn.*). Replaces SGLang's per-layer GDN decode tail for Qwen3.8-Flash-Next (36 linear-attention layers,
+// 16 key heads / 48 value heads of 128):
+//
+//   today (SGLang 0.5.20 on XPU, num_v_heads / num_k_heads = 3 -> fix_query_key_value_ordering branch):
+//     b.contiguous, a.contiguous, cat(q, k, v)       3 copy kernels
+//     causal_conv1d_update (Triton)                  1
+//     fused_recurrent_gated_delta_rule_packed_decode 1 (l2norm q/k, gates, recurrence)
+//     z reshape copy (bs > 1), RMSNormGated (Triton) 1-2
+//   here:
+//     conv:     depthwise causal conv (width 4) + conv-state shift + silu, read straight from the in_proj_qkvz output
+//               (the first q_dim + k_dim + v_dim columns ARE the concatenated q | k | v), written as bf16 [B, C]
+//     rec_norm: one work-group per (row, value head): q / k l2 norms, softplus / sigmoid gates from the raw in_proj_ba
+//               output (b | a columns), FP32 recurrence on the [V, K] state slice held in registers, bf16 rounding of o
+//               exactly where SGLang stores it, then the gated RMS norm (norm_before_gate, sigmoid or silu gate) over the
+//               head's 128 outputs and the bf16 output row ready for out_proj.  Optionally (ba != null) the alpha / beta
+//               projection itself (two 2560-long dot products per head, Strata's fused_gdn_ab) so the in_proj_ba GEMM
+//               disappears too.
+//
+// Port of Strata's fused_gdn_conv_l2 / fused_gdn_ab / fused_gdn_step_norm (sycl/src/kernels/cuda/fused_gdn.dp.cpp of
+// github.com/Niko1221/Strata, HEAD 82f46a8), adapted to SGLang's layouts and rounding points:
+//   * state pool [slots, H, V, K] (fp32 or bf16), value row v of head h contiguous over k (Strata: [k][h][v]); a thread
+//     owns RPT = 128 / RG consecutive k entries of one value column, the RG lanes of a column are adjacent lanes of one
+//     sub-group, so the k reductions are sub-group shuffles (no shared local memory, no barrier in the recurrence);
+//   * batched rows with per-row state slots (slot < 0 = padded row: output 0, no state / conv-state write);
+//   * GQA head map hk = h / (H / Hk) (SGLang), not Strata's h % Hk;
+//   * conv: products rounded to bf16 before the fp32 accumulation like the Triton kernel's bf16 x bf16 multiply
+//     (round_prod=1, default) and the conv state in SGLang's (slots, dim, state_len) view with arbitrary strides;
+//   * gates as fused_recurrent_gated_delta_rule_packed_decode: g = -exp(A_log) * softplus(a + dt_bias) (threshold 20),
+//     beta = bf16(sigmoid(b)); q, k l2-normalised elementwise (x / sqrt(sum x^2 + 1e-6)), q * scale; state decayed
+//     first, then kv = S.k, v' = (v - kv) * beta, S += k v', o = S.q;  o rounded to bf16 (SGLang's out tensor), then
+//     the gated norm on that bf16 value: y = ((o * rsqrt(mean(o^2) + eps)) * w) * gate(z).
+// No host synchronisation, no host reads of device data, outputs allocated with at::empty on the input's device:
+// capturable in an XPU graph (the decode path runs from graph replay).
+//
+// ---------------------------------------------------------------------------------------------------------------
+// Portions derived from Strata:
+//
+// MIT License
+//
+// Copyright (c) 2026 Niko1221 and the Strata contributors
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// ---------------------------------------------------------------------------------------------------------------
+
+#ifndef N114_NO_TORCH          // csrc/cpu_test_gdn.cpp includes this file without torch (OpenCL CPU device)
+#include <torch/all.h>
+#include <torch/library.h>
+#include <c10/xpu/XPUStream.h>
+#endif
+#include <sycl/sycl.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+
+#include <cstdint>
+
+namespace n114gdn {
+
+constexpr int KD = 128;   // key head dim
+constexpr int VD = 128;   // value head dim
+constexpr int SG = 16;    // sub-group size
+
+struct alignas(16) U4 { uint32_t x[4]; };
+
+static inline float bf2f(uint16_t b) { return sycl::bit_cast<float>((uint32_t)b << 16); }
+static inline float lo_bf(uint32_t w) { return sycl::bit_cast<float>(w << 16); }
+static inline float hi_bf(uint32_t w) { return sycl::bit_cast<float>(w & 0xffff0000u); }
+static inline uint16_t f2bf(float f) {   // round to nearest even (NaN stays NaN: quiet bit set by the add)
+    uint32_t u = sycl::bit_cast<uint32_t>(f);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t)((u >> 16) | 0x40u);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (uint16_t)(u >> 16);
+}
+static inline float rbf(float f) { return bf2f(f2bf(f)); }
+
+// scalar parameter vectors (A_log, dt_bias, norm weight) in their stored dtype: 0 fp32, 1 bf16, 2 fp16
+static inline float ldp(const void* p, int dt, int64_t i) {
+    if (dt == 1) return bf2f(static_cast<const uint16_t*>(p)[i]);
+    if (dt == 2) return (float)sycl::bit_cast<sycl::half>(static_cast<const uint16_t*>(p)[i]);
+    return static_cast<const float*>(p)[i];
+}
+static inline int64_t ldidx(const void* p, bool i64, int64_t i) {
+    return i64 ? static_cast<const int64_t*>(p)[i] : (int64_t) static_cast<const int32_t*>(p)[i];
+}
+
+// ------------------------------------------------------------------------------------------------ conv
+struct ConvArgs {
+    const uint16_t* x; int64_t xs;           // [B, >= C] bf16, row stride xs (elements), column stride 1
+    const uint16_t* w; int64_t ws0, ws1;     // [C, W] bf16 weights
+    uint16_t* st; int64_t ss0, ss1, ss2;     // conv state (slots, C, L) bf16, element strides
+    int64_t lines;                           // slots in the pool (bound check)
+    const void* idx; bool idx64;             // [B] slots
+    uint16_t* out;                           // [B, C] bf16
+    int64_t B, C;
+    bool silu, round_prod;
+};
+
+template <int W>
+struct ConvKernel {
+    ConvArgs a;
+    void operator()(sycl::nd_item<1> it) const {
+        const int64_t gid = (int64_t)it.get_global_id(0);
+        if (gid >= a.B * a.C) return;
+        const int64_t r = gid / a.C, c = gid - r * a.C;
+        const int64_t slot = ldidx(a.idx, a.idx64, r);
+        if (slot < 0 || slot >= a.lines) return;   // padded row: Triton returns without writing out or state
+        uint16_t* sp = a.st + slot * a.ss0 + c * a.ss1;
+        uint16_t win[W];
+#pragma unroll
+        for (int j = 0; j < W - 1; ++j) win[j] = sp[j * a.ss2];
+        win[W - 1] = a.x[r * a.xs + c];
+        float acc = 0.0f;
+#pragma unroll
+        for (int j = 0; j < W; ++j) {
+            const float p = bf2f(win[j]) * bf2f(a.w[c * a.ws0 + j * a.ws1]);
+            acc += a.round_prod ? rbf(p) : p;
+        }
+#pragma unroll
+        for (int j = 0; j < W - 1; ++j) sp[j * a.ss2] = win[j + 1];
+        if (a.silu) acc = acc / (1.0f + sycl::exp(-acc));
+        a.out[r * a.C + c] = f2bf(acc);
+    }
+};
+
+template <int W>
+static void submit_conv(sycl::queue& q, const ConvArgs& a) {
+    const int64_t n = a.B * a.C, wg = 256;
+    const int64_t glob = (n + wg - 1) / wg * wg;
+    ConvKernel<W> k{a};
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)glob), sycl::range<1>((size_t)wg)), k);
+    });
+}
+
+static bool dispatch_conv(int W, sycl::queue& q, const ConvArgs& a) {
+    if (W == 4) submit_conv<4>(q, a);
+    else if (W == 3) submit_conv<3>(q, a);
+    else if (W == 2) submit_conv<2>(q, a);
+    else return false;
+    return true;
+}
+
+// ------------------------------------------------------------------------------------------------ recurrence + norm
+struct RecArgs {
+    const uint16_t* qkv;                     // [B, >= 2*Hk*K + H*V] bf16 (conv output: q | k | v), row stride qs
+    int64_t qs;
+    const uint16_t* av; int64_t as_;         // a [B, H] bf16 view (row stride as_, column stride 1)   (ba == null)
+    const uint16_t* bv; int64_t bs_;         // b [B, H] bf16 view
+    const uint16_t* bx; int64_t bxs; int64_t D;   // ba fusion: x [B, D] bf16 (row stride bxs)
+    const uint16_t* bw;                      //                w_ba [2H, D] bf16 contiguous: rows 0..H-1 = b, H..2H-1 = a
+    const void* alog; int alog_dt;           // [H]
+    const void* dtb; int dtb_dt;             // [H]
+    void* state; int64_t sss;                // [slots, H, V, K] fp32 | bf16, slot stride (elements); inner dims dense
+    int64_t lines;
+    const void* idx; bool idx64;             // [B]
+    const uint16_t* z; int64_t zs;           // [B, H*V] bf16 view (row stride zs, column stride 1)
+    const void* nw; int nw_dt;               // [V] gated-norm weight
+    float eps;
+    int act;                                 // 0 sigmoid, 1 silu / swish, 2 none (rec only: y = bf16(o), no norm)
+    float scale, softplus_thr;
+    uint16_t* y;                             // [B, H*V] bf16
+    int H, Hk;
+};
+
+template <bool BF> struct StateIO;
+template <> struct StateIO<false> {
+    static inline float ld(const void* p, int64_t i) { return static_cast<const float*>(p)[i]; }
+    static inline void st(void* p, int64_t i, float x) { static_cast<float*>(p)[i] = x; }
+};
+template <> struct StateIO<true> {
+    static inline float ld(const void* p, int64_t i) { return bf2f(static_cast<const uint16_t*>(p)[i]); }
+    static inline void st(void* p, int64_t i, float x) { static_cast<uint16_t*>(p)[i] = f2bf(x); }
+};
+
+// Work-group = (row, value head h): VD columns x RG row groups; local id l: rg = l % RG, column = l / RG; RPT = K / RG
+// consecutive k entries of the column's state row per thread.  The RG lanes of a column are adjacent lanes of one
+// sub-group (SG % RG == 0).
+template <int RG, bool SBF, bool BIG>
+struct RecKernel {
+    RecArgs a;
+
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        namespace sx = sycl::ext::oneapi::experimental;
+        if constexpr (BIG) return sx::properties{sycl::ext::intel::experimental::grf_size<256>, sx::sub_group_size<SG>};
+        else return sx::properties{sx::sub_group_size<SG>};
+    }
+
+    void operator()(sycl::nd_item<1> it) const {
+        constexpr int RPT = KD / RG;
+        constexpr int NV = RPT / 8;   // 16-byte (8 x bf16) loads per q / k slice
+        static_assert(RPT % 8 == 0 && SG % RG == 0, "layout");
+        const int gid = (int)it.get_group(0);
+        const int row = gid / a.H, h = gid - row * a.H;
+        const int lid = (int)it.get_local_id(0);
+        const int rg = lid % RG, col = lid / RG;
+        const int hk = h / (a.H / a.Hk);
+        auto sg = it.get_sub_group();
+        auto wg = it.get_group();
+        const int64_t slot = ldidx(a.idx, a.idx64, row);
+        const bool valid = slot >= 0 && slot < a.lines;   // uniform over the work-group
+
+        // ---- gates (fp32, every lane computes the same scalars)
+        float a_val, b_val;
+        if (a.bw) {   // Strata fused_gdn_ab: alpha / beta projections of the layer input, rounded to bf16 like the GEMM
+            const uint16_t* x = a.bx + (int64_t)row * a.bxs;
+            const uint16_t* wb = a.bw + (int64_t)h * a.D;
+            const uint16_t* wa = a.bw + (int64_t)(a.H + h) * a.D;
+            float pa = 0.0f, pb = 0.0f;
+            for (int64_t i = lid; i < a.D; i += VD * RG) {
+                const float xv = bf2f(x[i]);
+                pb = sycl::fma(xv, bf2f(wb[i]), pb);
+                pa = sycl::fma(xv, bf2f(wa[i]), pa);
+            }
+            b_val = rbf(sycl::reduce_over_group(wg, pb, sycl::plus<float>()));
+            a_val = rbf(sycl::reduce_over_group(wg, pa, sycl::plus<float>()));
+        } else {
+            a_val = bf2f(a.av[(int64_t)row * a.as_ + h]);
+            b_val = bf2f(a.bv[(int64_t)row * a.bs_ + h]);
+        }
+        const float xg = a_val + ldp(a.dtb, a.dtb_dt, h);
+        const float sp = xg <= a.softplus_thr ? sycl::log(1.0f + sycl::exp(xg)) : xg;
+        const float g = -sycl::exp(ldp(a.alog, a.alog_dt, h)) * sp;
+        const float beta = rbf(1.0f / (1.0f + sycl::exp(-b_val)));
+        const float dec = sycl::exp(g);
+
+        float o = 0.0f;
+        if (valid) {
+            const uint16_t* qkv = a.qkv + (int64_t)row * a.qs;
+            const U4* qp = reinterpret_cast<const U4*>(qkv + hk * KD + rg * RPT);
+            const U4* kp = reinterpret_cast<const U4*>(qkv + (a.Hk + hk) * KD + rg * RPT);
+            U4 cq[NV];
+            float kn[RPT];
+            float ssq = 0.0f, ssk = 0.0f;
+#pragma unroll
+            for (int u = 0; u < NV; ++u) {
+                cq[u] = qp[u];
+                const U4 kw = kp[u];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float k0 = lo_bf(kw.x[j]), k1 = hi_bf(kw.x[j]);
+                    kn[u * 8 + 2 * j] = k0; kn[u * 8 + 2 * j + 1] = k1;
+                    ssk = sycl::fma(k0, k0, ssk); ssk = sycl::fma(k1, k1, ssk);
+                    const float q0 = lo_bf(cq[u].x[j]), q1 = hi_bf(cq[u].x[j]);
+                    ssq = sycl::fma(q0, q0, ssq); ssq = sycl::fma(q1, q1, ssq);
+                }
+            }
+#pragma unroll
+            for (int m = 1; m < RG; m <<= 1) {
+                ssq += sycl::permute_group_by_xor(sg, ssq, m);
+                ssk += sycl::permute_group_by_xor(sg, ssk, m);
+            }
+            const float dk = sycl::sqrt(ssk + 1e-6f), dq = sycl::sqrt(ssq + 1e-6f);
+#pragma unroll
+            for (int r = 0; r < RPT; ++r) kn[r] = kn[r] / dk;
+            const float vv = bf2f(qkv[2 * a.Hk * KD + h * VD + col]);
+
+            float s[RPT];
+            const int64_t soff = slot * a.sss + ((int64_t)h * VD + col) * KD + rg * RPT;
+#pragma unroll
+            for (int r = 0; r < RPT; ++r) s[r] = StateIO<SBF>::ld(a.state, soff + r) * dec;
+            float k0 = 0.0f, k1 = 0.0f, k2 = 0.0f, k3 = 0.0f;
+#pragma unroll
+            for (int r = 0; r < RPT; r += 4) {
+                k0 = sycl::fma(s[r], kn[r], k0); k1 = sycl::fma(s[r + 1], kn[r + 1], k1);
+                k2 = sycl::fma(s[r + 2], kn[r + 2], k2); k3 = sycl::fma(s[r + 3], kn[r + 3], k3);
+            }
+            float kv = (k0 + k1) + (k2 + k3);
+#pragma unroll
+            for (int m = 1; m < RG; m <<= 1) kv += sycl::permute_group_by_xor(sg, kv, m);
+            const float d = (vv - kv) * beta;
+            float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+#pragma unroll
+            for (int u = 0; u < NV; ++u) {
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const int r = u * 8 + 2 * j;
+                    s[r] = sycl::fma(kn[r], d, s[r]);
+                    s[r + 1] = sycl::fma(kn[r + 1], d, s[r + 1]);
+                    const float q0 = (lo_bf(cq[u].x[j]) / dq) * a.scale, q1 = (hi_bf(cq[u].x[j]) / dq) * a.scale;
+                    if (j & 1) { o1 = sycl::fma(s[r], q0, o1); o3 = sycl::fma(s[r + 1], q1, o3); }
+                    else { o0 = sycl::fma(s[r], q0, o0); o2 = sycl::fma(s[r + 1], q1, o2); }
+                }
+            }
+            o = (o0 + o1) + (o2 + o3);
+#pragma unroll
+            for (int m = 1; m < RG; m <<= 1) o += sycl::permute_group_by_xor(sg, o, m);
+#pragma unroll
+            for (int r = 0; r < RPT; ++r) StateIO<SBF>::st(a.state, soff + r, s[r]);
+            o = rbf(o);   // SGLang stores the recurrence output as bf16 before the norm
+        }
+
+        uint16_t* yrow = a.y + (int64_t)row * a.H * VD + (int64_t)h * VD;
+        if (a.act == 2) {   // recurrence output only (tests / no norm)
+            if (rg == 0) yrow[col] = valid ? f2bf(o) : (uint16_t)0;
+            return;
+        }
+        // ---- gated RMS norm over the head's 128 outputs (one value per column: the rg == 0 lanes)
+        const float sq = (rg == 0) ? o * o : 0.0f;
+        const float ss = sycl::reduce_over_group(wg, sq, sycl::plus<float>());
+        if (rg != 0) return;
+        if (!valid) { yrow[col] = 0; return; }
+        const float rstd = sycl::rsqrt(ss / (float)VD + a.eps);
+        float yv = (o * rstd) * ldp(a.nw, a.nw_dt, col);
+        const float zz = bf2f(a.z[(int64_t)row * a.zs + (int64_t)h * VD + col]);
+        const float sgz = 1.0f / (1.0f + sycl::exp(-zz));
+        yv = (a.act == 1) ? yv * (zz * sgz) : yv * sgz;
+        yrow[col] = f2bf(yv);
+    }
+};
+
+template <int RG, bool SBF, bool BIG>
+static void submit_rec(sycl::queue& q, const RecArgs& a, int64_t B) {
+    const size_t groups = (size_t)B * a.H;
+    RecKernel<RG, SBF, BIG> k{a};
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(groups * VD * RG), sycl::range<1>(VD * RG)), k);
+    });
+}
+
+template <int RG>
+static void dispatch_rec_rg(bool sbf, bool big, sycl::queue& q, const RecArgs& a, int64_t B) {
+    if (sbf) { if (big) submit_rec<RG, true, true>(q, a, B); else submit_rec<RG, true, false>(q, a, B); }
+    else { if (big) submit_rec<RG, false, true>(q, a, B); else submit_rec<RG, false, false>(q, a, B); }
+}
+
+static bool dispatch_rec(int rg, bool sbf, bool big, sycl::queue& q, const RecArgs& a, int64_t B) {
+    if (rg == 4) dispatch_rec_rg<4>(sbf, big, q, a, B);
+    else if (rg == 8) dispatch_rec_rg<8>(sbf, big, q, a, B);
+    else if (rg == 2) dispatch_rec_rg<2>(sbf, big, q, a, B);
+    else return false;
+    return true;
+}
+
+#ifndef N114_NO_TORCH
+static sycl::queue& queue_of(const at::Tensor& t) { return c10::xpu::getCurrentXPUStream(t.device().index()).queue(); }
+
+static int pdt(const at::Tensor& t) {
+    if (t.scalar_type() == at::kFloat) return 0;
+    if (t.scalar_type() == at::kBFloat16) return 1;
+    if (t.scalar_type() == at::kHalf) return 2;
+    TORCH_CHECK(false, "n114gdn: parameter dtype must be fp32/bf16/fp16, got ", t.scalar_type());
+    return 0;
+}
+
+static void check_idx(const at::Tensor& idx, int64_t B) {
+    TORCH_CHECK(idx.is_xpu() && idx.dim() == 1 && idx.size(0) == B && idx.is_contiguous() &&
+                (idx.scalar_type() == at::kInt || idx.scalar_type() == at::kLong), "n114gdn: idx [B] int32|int64 contiguous");
+}
+
+// x [B, >= C] bf16 (column stride 1), w [C, W] bf16, state (slots, C, L >= W - 1) bf16 (updated in place), idx [B].
+// Returns out [B, C] bf16 (rows of padded slots are left uninitialised, like the Triton kernel).
+at::Tensor gdn_conv(at::Tensor x, at::Tensor w, at::Tensor state, at::Tensor idx, int64_t C, bool silu, bool round_prod) {
+    TORCH_CHECK(x.is_xpu() && w.is_xpu() && state.is_xpu(), "n114gdn.conv: XPU tensors");
+    TORCH_CHECK(x.dim() == 2 && x.scalar_type() == at::kBFloat16 && x.stride(1) == 1 && x.size(1) >= C,
+                "n114gdn.conv: x [B, >=C] bf16, column stride 1");
+    TORCH_CHECK(w.dim() == 2 && w.scalar_type() == at::kBFloat16 && w.size(0) == C, "n114gdn.conv: w [C, W] bf16");
+    TORCH_CHECK(state.dim() == 3 && state.scalar_type() == at::kBFloat16 && state.size(1) == C &&
+                state.size(2) >= w.size(1) - 1, "n114gdn.conv: state (slots, C, L) bf16");
+    const int64_t B = x.size(0);
+    check_idx(idx, B);
+    auto out = at::empty({B, C}, x.options());
+    if (B == 0 || C == 0) return out;
+    ConvArgs a{};
+    a.x = reinterpret_cast<const uint16_t*>(x.data_ptr()); a.xs = x.stride(0);
+    a.w = reinterpret_cast<const uint16_t*>(w.data_ptr()); a.ws0 = w.stride(0); a.ws1 = w.stride(1);
+    a.st = reinterpret_cast<uint16_t*>(state.data_ptr()); a.ss0 = state.stride(0); a.ss1 = state.stride(1);
+    a.ss2 = state.stride(2); a.lines = state.size(0);
+    a.idx = idx.data_ptr(); a.idx64 = idx.scalar_type() == at::kLong;
+    a.out = reinterpret_cast<uint16_t*>(out.data_ptr());
+    a.B = B; a.C = C; a.silu = silu; a.round_prod = round_prod;
+    TORCH_CHECK(dispatch_conv((int)w.size(1), queue_of(x), a), "n114gdn.conv: conv width must be 2..4");
+    return out;
+}
+
+// qkv [B, >= 2*Hk*128 + H*128] bf16 (row stride multiple of 8, 16-byte aligned base); a / b [B, H] bf16 views
+// (column stride 1) or ba fusion (bx [B, D] bf16 + w_ba [2H, D] bf16 contiguous; pass empty a / b); A_log, dt_bias [H];
+// state [slots, H, 128, 128] fp32 | bf16 (updated in place); idx [B]; z [B, H*128] bf16 view (column stride 1);
+// norm_w [128]; act 0 sigmoid / 1 silu / 2 none.  Returns y [B, H*128] bf16.
+at::Tensor gdn_rec_norm(at::Tensor qkv, at::Tensor a_, at::Tensor b_, at::Tensor bx, at::Tensor wba, at::Tensor alog,
+                        at::Tensor dtb, at::Tensor state, at::Tensor idx, at::Tensor z, at::Tensor nw, double eps,
+                        int64_t act, double scale, int64_t H, int64_t Hk, int64_t rg, int64_t grf) {
+    TORCH_CHECK(qkv.is_xpu() && state.is_xpu() && z.is_xpu() && nw.is_xpu() && alog.is_xpu() && dtb.is_xpu(),
+                "n114gdn.rec_norm: XPU tensors");
+    TORCH_CHECK(qkv.dim() == 2 && qkv.scalar_type() == at::kBFloat16 && qkv.stride(1) == 1 && qkv.stride(0) % 8 == 0 &&
+                reinterpret_cast<uintptr_t>(qkv.data_ptr()) % 16 == 0 && qkv.size(1) >= 2 * Hk * KD + H * VD,
+                "n114gdn.rec_norm: qkv [B, C] bf16, 16-byte aligned rows");
+    TORCH_CHECK(H > 0 && Hk > 0 && H % Hk == 0, "n114gdn.rec_norm: H % Hk");
+    const int64_t B = qkv.size(0);
+    check_idx(idx, B);
+    TORCH_CHECK(state.dim() == 4 && state.size(1) == H && state.size(2) == VD && state.size(3) == KD &&
+                state.stride(3) == 1 && state.stride(2) == KD && state.stride(1) == VD * KD &&
+                (state.scalar_type() == at::kFloat || state.scalar_type() == at::kBFloat16),
+                "n114gdn.rec_norm: state [slots, H, 128, 128] fp32|bf16, dense inner dims");
+    TORCH_CHECK(z.dim() == 2 && z.size(0) == B && z.size(1) >= H * VD && z.stride(1) == 1 && z.scalar_type() == at::kBFloat16,
+                "n114gdn.rec_norm: z [B, H*128] bf16");
+    TORCH_CHECK(act >= 0 && act <= 2, "n114gdn.rec_norm: act");
+    TORCH_CHECK((act == 2 || (nw.numel() == VD && nw.is_contiguous())) && alog.numel() == H && dtb.numel() == H &&
+                alog.is_contiguous() && dtb.is_contiguous(), "n114gdn.rec_norm: norm_w [128], A_log / dt_bias [H] contiguous");
+    RecArgs ra{};
+    const bool fuse_ba = wba.defined() && wba.numel() > 0;
+    if (fuse_ba) {
+        TORCH_CHECK(bx.is_xpu() && wba.is_xpu() && bx.dim() == 2 && bx.size(0) == B && bx.stride(1) == 1 &&
+                    bx.scalar_type() == at::kBFloat16 && wba.dim() == 2 && wba.size(0) == 2 * H &&
+                    wba.size(1) == bx.size(1) && wba.is_contiguous() && wba.scalar_type() == at::kBFloat16,
+                    "n114gdn.rec_norm: ba fusion x [B, D] / w_ba [2H, D] bf16");
+        ra.bx = reinterpret_cast<const uint16_t*>(bx.data_ptr()); ra.bxs = bx.stride(0); ra.D = bx.size(1);
+        ra.bw = reinterpret_cast<const uint16_t*>(wba.data_ptr());
+    } else {
+        TORCH_CHECK(a_.is_xpu() && b_.is_xpu() && a_.dim() == 2 && b_.dim() == 2 && a_.size(0) == B && b_.size(0) == B &&
+                    a_.size(1) == H && b_.size(1) == H && a_.stride(1) == 1 && b_.stride(1) == 1 &&
+                    a_.scalar_type() == at::kBFloat16 && b_.scalar_type() == at::kBFloat16,
+                    "n114gdn.rec_norm: a / b [B, H] bf16 views");
+        ra.av = reinterpret_cast<const uint16_t*>(a_.data_ptr()); ra.as_ = a_.stride(0);
+        ra.bv = reinterpret_cast<const uint16_t*>(b_.data_ptr()); ra.bs_ = b_.stride(0);
+    }
+    auto y = at::empty({B, H * VD}, qkv.options());
+    if (B == 0) return y;
+    ra.qkv = reinterpret_cast<const uint16_t*>(qkv.data_ptr()); ra.qs = qkv.stride(0);
+    ra.alog = alog.data_ptr(); ra.alog_dt = pdt(alog);
+    ra.dtb = dtb.data_ptr(); ra.dtb_dt = pdt(dtb);
+    ra.state = state.data_ptr(); ra.sss = state.stride(0); ra.lines = state.size(0);
+    ra.idx = idx.data_ptr(); ra.idx64 = idx.scalar_type() == at::kLong;
+    ra.z = reinterpret_cast<const uint16_t*>(z.data_ptr()); ra.zs = z.stride(0);
+    ra.nw = nw.data_ptr(); ra.nw_dt = act == 2 ? 1 : pdt(nw);
+    ra.eps = (float)eps; ra.act = (int)act; ra.scale = (float)scale; ra.softplus_thr = 20.0f;
+    ra.y = reinterpret_cast<uint16_t*>(y.data_ptr());
+    ra.H = (int)H; ra.Hk = (int)Hk;
+    TORCH_CHECK(dispatch_rec((int)rg, state.scalar_type() == at::kBFloat16, grf == 256, queue_of(qkv), ra, B),
+                "n114gdn.rec_norm: rg must be 2, 4 or 8");
+    return y;
+}
+#endif  // N114_NO_TORCH
+}  // namespace n114gdn
+
+#ifndef N114_NO_TORCH
+TORCH_LIBRARY(n114gdn, m) {
+    m.def("conv(Tensor x, Tensor w, Tensor(a!) state, Tensor idx, int C, bool silu, bool round_prod) -> Tensor");
+    m.def("rec_norm(Tensor qkv, Tensor a, Tensor b, Tensor bx, Tensor wba, Tensor A_log, Tensor dt_bias, Tensor(a!) state, "
+          "Tensor idx, Tensor z, Tensor norm_w, float eps, int act, float scale, int H, int Hk, int rg, int grf) -> Tensor");
+    m.impl("conv", torch::kXPU, &n114gdn::gdn_conv);
+    m.impl("rec_norm", torch::kXPU, &n114gdn::gdn_rec_norm);
+}
+#endif

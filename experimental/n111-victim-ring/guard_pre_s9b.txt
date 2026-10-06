@@ -1,0 +1,11 @@
+GUARD pre-s9b 2026-10-06T21:48:59+02:00 health=200
+AER 80:03.1 nonfatal=0 fatal=0
+AER 82:00.0 nonfatal=0 fatal=0
+AER 83:01.0 nonfatal=0 fatal=0
+AER 83:02.0 nonfatal=0 fatal=0
+AER 84:00.0 nonfatal=na fatal=na
+AER 81:00.0 nonfatal=0 fatal=0
+corrected_records_ours=0
+KERNEL_OK
+DSTATE_OK
+GUARD_PASS

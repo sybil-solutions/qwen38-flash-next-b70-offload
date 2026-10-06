@@ -1,0 +1,819 @@
+// NVMe tier (tier 2) for the Qwen3.8-Flash-Next EXL3 n-gram table (exl3_ngram_trellis, 102 B rows).
+//
+// Rows stay in ngram_embedding.safetensors on NVMe. A fixed-budget RAM row cache (CLOCK, keyed by row id) lives in
+// page-locked, device-mapped host memory ("slab"); the existing ngram_gather_dequant kernel reads the cached rows
+// zero-copy through slot ids, so the GPU side is unchanged apart from the id -> slot indirection.
+//
+// Host side (RowStore):
+//   resolve(ids[n]) -> slots[n]: direct-mapped row -> slot index (1.28 GB lazily-zeroed map for 320M rows), CLOCK
+//   eviction that never evicts a slot used by the current request (epoch pin), in-request dedup, misses sorted by file
+//   offset and coalesced into 4 KiB-aligned runs, read with O_DIRECT through Linux native AIO (io_submit, one issuer,
+//   deep queue; io_uring is disabled on the box: kernel.io_uring_disabled=1 and docker's seccomp) or a pread thread
+//   pool, or buffered pread (page-cache comparison).
+//   A service thread polls a request word in mapped host memory; this makes the tier graph safe:
+//
+// GPU side (all captured in the decode graph, no host involvement at capture time):
+//   nvme_publish: copy the SGLang-hashed ids to mapped host memory, bump the device-owned seq, release-store req_seq
+//   nvme_wait:    one thread spins (acquire.sys) until done_seq == seq (records the stall in ns), bounded by a timeout
+//   nvme_slots:   copy the resolved slot ids to a device int64 buffer -> ngram_gather_dequant(slots, slab, ...)
+// Requests are strictly serialized on one stream (publish k+1 is ordered after gather k), so slots handed out for
+// request k are never evicted while the GPU still reads them.
+#include <torch/extension.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/intel/experimental/esimd/memory.hpp>
+#include <linux/aio_abi.h>
+#include <sys/syscall.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <immintrin.h>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <cstring>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+// ---------------------------------------------------------------------------------------------------------------
+// GPU side
+
+// ctrl words (u32, mapped host): [0] req_seq (GPU writes), [1] req_n, [2] done_seq (host writes), [3] error,
+// [4] abort (host sets on shutdown), [8..] 64-bit stall stats: [8..9] total ns, [10..11] count, [12..13] max ns
+#define C_REQ 0
+#define C_N 1
+#define C_DONE 2
+#define C_ERR 3
+#define C_ABORT 4
+
+// ---------------------------------------------------------------------------------------------------------------
+// host side
+
+static inline double now_us()
+{
+    return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static void* host_alloc(size_t bytes, bool hugepage)
+{
+    void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) throw std::runtime_error("ngram_nvme: mmap failed");
+    if (hugepage) madvise(p, bytes, MADV_HUGEPAGE);
+    return p;
+}
+
+// XPU: device-visible host buffers come from sycl::malloc_host in torch's XPU context (no host-register API)
+static sycl::queue& xq() { return c10::xpu::getCurrentXPUStream().queue(); }
+static void* usm_alloc(size_t bytes)
+{
+    void* p = sycl::malloc_host(bytes, xq());
+    if (!p) throw std::runtime_error("ngram_nvme: sycl::malloc_host failed");
+    return p;
+}
+// GPU reads of host USM on B70 do not snoop the CPU caches: every host store the GPU must see (done_seq, resp) is
+// written back with clflushopt + sfence before it is published.
+static inline void flush_lines(const void* p, size_t bytes)
+{
+    const char* a = (const char*) ((uintptr_t) p & ~(uintptr_t) 63);
+    const char* e = (const char*) p + bytes;
+    for (; a < e; a += 64) _mm_clflushopt((void*) a);
+    _mm_sfence();
+}
+static void usm_free(void* p) { if (p) sycl::free(p, xq().get_context()); }
+
+static int64_t pyrem(int64_t a, int64_t m) { int64_t r = a % m; return r < 0 ? r + m : r; }
+
+struct Extent { int64_t row0, rows, file_off; };
+struct Miss { int64_t off; int64_t slot; };
+struct Run { int64_t off, len; int32_t m0, m1; };   // aligned file span, misses [m0, m1)
+
+enum Backend { AIO = 0, PREAD = 1, BUFFERED = 2 };
+
+class RowStore
+{
+public:
+    RowStore(const std::string& path, std::vector<int64_t> row0, std::vector<int64_t> rows, std::vector<int64_t> file_off,
+             int64_t row_bytes, int64_t nslots, int64_t backend, int64_t threads, int64_t qd, int64_t max_run,
+             int64_t merge_gap, int64_t cap)
+        : row_bytes_(row_bytes), nslots_(nslots), backend_((int) backend), threads_((int) threads), qd_((int) qd),
+          max_run_(max_run), merge_gap_(merge_gap), cap_(cap)
+    {
+        for (size_t i = 0; i < row0.size(); ++i) ext_.push_back({row0[i], rows[i], file_off[i]});
+        num_rows_ = ext_.back().row0 + ext_.back().rows;
+        fd_ = open(path.c_str(), O_RDONLY | (backend_ == BUFFERED ? 0 : O_DIRECT));
+        if (fd_ < 0) throw std::runtime_error("ngram_nvme: open " + path + " failed: " + strerror(errno));
+        if (backend_ == BUFFERED) posix_fadvise(fd_, 0, 0, POSIX_FADV_RANDOM);
+        if (nslots_ < cap_) throw std::runtime_error("ngram_nvme: cache smaller than one request (slots < max ids)");
+        map_ = (int32_t*) host_alloc((size_t) num_rows_ * 4, true);          // row -> slot + 1, 0 = absent
+        slot_row_ = (int32_t*) host_alloc((size_t) nslots_ * 4, true);
+        ref_ = (uint8_t*) host_alloc((size_t) nslots_, true);
+        epoch_ = (uint32_t*) host_alloc((size_t) nslots_ * 4, true);
+        std::fill(slot_row_, slot_row_ + nslots_, -1);
+        // slab: page-locked + mapped (registered by the caller from Python), 64 B tail pad for the kernel's loads
+        slab_bytes_ = ((size_t) nslots_ * row_bytes_ + 4095 + 64) & ~(size_t) 4095;
+        slab_ = (uint8_t*) usm_alloc(slab_bytes_);
+        memset(slab_, 0, slab_bytes_);
+        // mapped request / response / control
+        io_bytes_ = (((size_t) cap_ * 8 + 4095) & ~(size_t) 4095);
+        req_ = (int64_t*) usm_alloc(io_bytes_);
+        resp_ = (int64_t*) usm_alloc(io_bytes_);
+        ctrl_ = (uint32_t*) usm_alloc(4096);
+        memset(ctrl_, 0, 4096);
+        // bounce buffers: one per queue slot (aio) or per thread (pread)
+        nbounce_ = std::max(qd_, threads_) + 1;
+        bounce_ = (uint8_t*) host_alloc((size_t) nbounce_ * max_run_, false);
+        if (backend_ == AIO)
+        {
+            aio_ctx_ = 0;
+            if (syscall(SYS_io_setup, qd_, &aio_ctx_) < 0)
+                throw std::runtime_error(std::string("ngram_nvme: io_setup failed: ") + strerror(errno));
+        }
+        if (backend_ != AIO && threads_ > 1)
+            for (int t = 1; t < threads_; ++t) pool_.emplace_back(&RowStore::pool_worker, this, t);
+    }
+
+    ~RowStore() { close(); }
+
+    void close()
+    {
+        stop_service();
+        {
+            std::lock_guard<std::mutex> g(pool_mu_);
+            pool_quit_ = true;
+        }
+        pool_cv_.notify_all();
+        for (auto& t : pool_) t.join();
+        pool_.clear();
+        if (aio_ctx_) { syscall(SYS_io_destroy, aio_ctx_); aio_ctx_ = 0; }
+        if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+        // host memory is left mapped: the caller unregisters the slab/io buffers first, then calls release_memory()
+    }
+
+    void release_memory()
+    {
+        auto un = [](void* p, size_t b) { if (p) munmap(p, b); };
+        un(map_, (size_t) num_rows_ * 4); map_ = nullptr;
+        un(slot_row_, (size_t) nslots_ * 4); slot_row_ = nullptr;
+        un(ref_, (size_t) nslots_); ref_ = nullptr;
+        un(epoch_, (size_t) nslots_ * 4); epoch_ = nullptr;
+        usm_free(slab_); slab_ = nullptr;
+        usm_free(req_); req_ = nullptr;
+        usm_free(resp_); resp_ = nullptr;
+        usm_free(ctrl_); ctrl_ = nullptr;
+        un(bounce_, (size_t) nbounce_ * max_run_); bounce_ = nullptr;
+    }
+
+    // --- pointers for registration / kernels
+    int64_t slab_ptr() const { return (int64_t) slab_; }
+    int64_t slab_bytes() const { return (int64_t) slab_bytes_; }
+    int64_t req_ptr() const { return (int64_t) req_; }
+    int64_t resp_ptr() const { return (int64_t) resp_; }
+    int64_t io_bytes() const { return (int64_t) io_bytes_; }
+    int64_t ctrl_ptr() const { return (int64_t) ctrl_; }
+    int64_t num_rows() const { return num_rows_; }
+    int64_t nslots() const { return nslots_; }
+
+    // --- core: ids -> slots (thread-safe via mutex)
+    void resolve(const int64_t* ids, int64_t n, int64_t* slots)
+    {
+        std::lock_guard<std::mutex> g(mu_);
+        resolve_locked(ids, n, slots, true);
+    }
+
+    void resolve_tensor(torch::Tensor ids, torch::Tensor slots)
+    {
+        TORCH_CHECK(ids.is_cpu() && ids.scalar_type() == at::kLong && ids.is_contiguous(), "resolve: ids int64 cpu");
+        TORCH_CHECK(slots.is_cpu() && slots.scalar_type() == at::kLong && slots.is_contiguous() &&
+                    slots.numel() >= ids.numel(), "resolve: slots int64 cpu");
+        TORCH_CHECK(ids.numel() <= cap_, "resolve: more ids than the store's request capacity");
+        resolve(ids.data_ptr<int64_t>(), ids.numel(), slots.data_ptr<int64_t>());
+    }
+
+    // warm the cache without pinning (prefetch hint); returns misses read
+    int64_t warm_tensor(torch::Tensor ids)
+    {
+        TORCH_CHECK(ids.is_cpu() && ids.scalar_type() == at::kLong && ids.is_contiguous(), "warm: ids int64 cpu");
+        const int64_t* p = ids.data_ptr<int64_t>();
+        int64_t n = ids.numel(), done = 0, before;
+        std::vector<int64_t> tmp;
+        {
+            std::lock_guard<std::mutex> g(mu_);
+            before = st_warm_misses_;
+        }
+        // chunks so a concurrent decode request waits at most one chunk of I/O
+        const int64_t chunk = std::min<int64_t>(cap_, warm_chunk_);
+        while (done < n)
+        {
+            int64_t m = std::min(chunk, n - done);
+            tmp.resize(m);
+            while (svc_waiting_.load(std::memory_order_acquire)) std::this_thread::yield();   // service first
+            std::lock_guard<std::mutex> g(mu_);
+            resolve_locked(p + done, m, tmp.data(), false);
+            done += m;
+        }
+        std::lock_guard<std::mutex> g(mu_);
+        return st_warm_misses_ - before;
+    }
+
+    void set_warm_chunk(int64_t c) { warm_chunk_ = std::max<int64_t>(16, c); }
+    // dry run: cache bookkeeping only, no reads (hit-rate simulation on large corpora)
+    void set_dry(bool d) { dry_ = d; }
+
+    // copy the raw bytes of the rows behind slots (verification)
+    void read_slots(torch::Tensor slots, torch::Tensor out)
+    {
+        int64_t n = slots.numel();
+        TORCH_CHECK(out.numel() * out.element_size() >= n * row_bytes_, "read_slots: out too small");
+        uint8_t* o = (uint8_t*) out.data_ptr();
+        const int64_t* s = slots.data_ptr<int64_t>();
+        for (int64_t i = 0; i < n; ++i)
+        {
+            if (s[i] < 0) memset(o + i * row_bytes_, 0, row_bytes_);
+            else memcpy(o + i * row_bytes_, slab_ + s[i] * row_bytes_, row_bytes_);
+        }
+    }
+
+    // --- service thread (graph handshake)
+    void start_service(int64_t spin_us)
+    {
+        if (svc_.joinable()) return;
+        svc_quit_ = false;
+        spin_us_ = spin_us;
+        last_seq_ = __atomic_load_n(ctrl_ + C_REQ, __ATOMIC_ACQUIRE);
+        svc_ = std::thread(&RowStore::service_loop, this);
+    }
+
+    void stop_service()
+    {
+        if (!svc_.joinable()) return;
+        svc_quit_ = true;
+        __atomic_store_n(ctrl_ + C_ABORT, 1u, __ATOMIC_RELEASE);
+        svc_.join();
+        __atomic_store_n(ctrl_ + C_ABORT, 0u, __ATOMIC_RELEASE);
+    }
+
+    // --- stats
+    std::vector<int64_t> counters()
+    {
+        std::lock_guard<std::mutex> g(mu_);
+        return {st_requests_, st_lookups_, st_unique_, st_hits_, st_misses_, st_runs_, st_bytes_, st_blocks_,
+                (int64_t) st_io_us_, (int64_t) st_resolve_us_, st_resident_, (int64_t) ctrl_[C_ERR],
+                st_warm_lookups_, st_warm_misses_, st_warm_bytes_, (int64_t) st_warm_us_};
+    }
+
+    void reset_counters()
+    {
+        std::lock_guard<std::mutex> g(mu_);
+        st_requests_ = st_lookups_ = st_unique_ = st_hits_ = st_misses_ = st_runs_ = st_bytes_ = st_blocks_ = 0;
+        st_io_us_ = st_resolve_us_ = st_warm_us_ = 0.0;
+        st_warm_lookups_ = st_warm_misses_ = st_warm_bytes_ = 0;
+        log_.clear();
+    }
+
+    // per-request log: [n, unique, misses, runs, resolve_us*1000, io_us*1000, poll_to_done_us*1000]
+    torch::Tensor request_log()
+    {
+        std::lock_guard<std::mutex> g(mu_);
+        auto t = torch::empty({(int64_t) log_.size() / 7, 7}, torch::kLong);
+        if (!log_.empty()) memcpy(t.data_ptr<int64_t>(), log_.data(), log_.size() * 8);
+        return t;
+    }
+
+    void drop_cache()
+    {
+        std::lock_guard<std::mutex> g(mu_);
+        for (int64_t s = 0; s < nslots_; ++s)
+        {
+            if (slot_row_[s] >= 0) map_[slot_row_[s]] = 0;
+            slot_row_[s] = -1;
+            ref_[s] = 0;
+        }
+        st_resident_ = 0;
+        hand_ = 0;
+    }
+
+private:
+    int64_t file_offset(int64_t row) const
+    {
+        // extents are few (128 shards) and uniform in size; binary search
+        int lo = 0, hi = (int) ext_.size() - 1;
+        while (lo < hi)
+        {
+            int mid = (lo + hi + 1) / 2;
+            if (ext_[mid].row0 <= row) lo = mid; else hi = mid - 1;
+        }
+        return ext_[lo].file_off + (row - ext_[lo].row0) * row_bytes_;
+    }
+
+    int64_t evict_one()
+    {
+        int64_t spins = 0;
+        while (true)
+        {
+            int64_t s = hand_;
+            hand_ = hand_ + 1 == nslots_ ? 0 : hand_ + 1;
+            if (slot_row_[s] < 0) { st_resident_++; return s; }
+            if (epoch_[s] == cur_epoch_ || epoch_[s] == svc_epoch_) { if (++spins > 3 * nslots_) throw std::runtime_error("ngram_nvme: all slots pinned"); continue; }
+            if (ref_[s]) { ref_[s] = 0; continue; }
+            map_[slot_row_[s]] = 0;
+            return s;
+        }
+    }
+
+    void resolve_locked(const int64_t* ids, int64_t n, int64_t* slots, bool service)
+    {
+        double t0 = now_us();
+        ++cur_epoch_;
+        if (service) svc_epoch_ = cur_epoch_;
+        misses_.clear();
+        int64_t hits = 0, uniq = 0;
+        for (int64_t i = 0; i < n; ++i)
+        {
+            int64_t r = ids[i];
+            if (r < 0 || r >= num_rows_) { slots[i] = -1; continue; }
+            int32_t s1 = map_[r];
+            if (s1)
+            {
+                int64_t s = s1 - 1;
+                if (epoch_[s] != cur_epoch_) { uniq++; hits++; epoch_[s] = cur_epoch_; }   // else: dup in this request
+                ref_[s] = 1;
+                slots[i] = s;
+            }
+            else
+            {
+                int64_t s = evict_one();
+                map_[r] = (int32_t) (s + 1);
+                slot_row_[s] = (int32_t) r;
+                ref_[s] = 1;
+                epoch_[s] = cur_epoch_;
+                slots[i] = s;
+                misses_.push_back({file_offset(r), s});
+                uniq++;
+            }
+        }
+        double t1 = now_us();
+        int64_t runs = 0, bytes = 0, blocks = 0;
+        if (!misses_.empty() && !dry_) read_misses(runs, bytes, blocks);
+        double t2 = now_us();
+        if (!service)
+        {
+            st_warm_lookups_ += n;
+            st_warm_misses_ += (int64_t) misses_.size();
+            st_warm_bytes_ += bytes;
+            st_warm_us_ += t2 - t0;
+            return;
+        }
+        st_requests_++;
+        st_lookups_ += n;
+        st_unique_ += uniq;
+        st_hits_ += hits;
+        st_misses_ += (int64_t) misses_.size();
+        st_runs_ += runs;
+        st_bytes_ += bytes;
+        st_blocks_ += blocks;
+        st_io_us_ += t2 - t1;
+        st_resolve_us_ += t1 - t0;
+        if (log_.size() < (size_t) 7 * 4000000)
+        {
+            int64_t e[7] = {n, uniq, (int64_t) misses_.size(), runs, (int64_t) ((t1 - t0) * 1000), (int64_t) ((t2 - t1) * 1000), 0};
+            log_.insert(log_.end(), e, e + 7);
+        }
+    }
+
+    void build_runs(int64_t& blocks)
+    {
+        std::sort(misses_.begin(), misses_.end(), [](const Miss& a, const Miss& b) { return a.off < b.off; });
+        runs_.clear();
+        blocks = 0;
+        for (int32_t i = 0; i < (int32_t) misses_.size(); ++i)
+        {
+            int64_t a = misses_[i].off & ~(int64_t) 4095;
+            int64_t b = (misses_[i].off + row_bytes_ + 4095) & ~(int64_t) 4095;
+            if (!runs_.empty())
+            {
+                Run& r = runs_.back();
+                int64_t end = r.off + r.len;
+                if (a <= end + merge_gap_ && b - r.off <= max_run_)
+                {
+                    if (b > end) { blocks += (b - std::max(a, end)) / 4096; r.len = b - r.off; }
+                    r.m1 = i + 1;
+                    continue;
+                }
+            }
+            runs_.push_back({a, b - a, i, i + 1});
+            blocks += (b - a) / 4096;
+        }
+    }
+
+    void scatter_run(const Run& r, const uint8_t* buf)
+    {
+        for (int32_t m = r.m0; m < r.m1; ++m)
+        {
+            memcpy(slab_ + misses_[m].slot * row_bytes_, buf + (misses_[m].off - r.off), row_bytes_);
+            flush_lines(slab_ + misses_[m].slot * row_bytes_, row_bytes_);   // GPU reads do not snoop
+        }
+    }
+
+    void read_one(const Run& r, uint8_t* buf)
+    {
+        int64_t got = 0;
+        while (got < r.len)
+        {
+            ssize_t k = pread(fd_, buf + got, r.len - got, r.off + got);
+            if (k < 0) { if (errno == EINTR) continue; throw std::runtime_error(std::string("ngram_nvme: pread: ") + strerror(errno)); }
+            if (k == 0) break;   // EOF (last block of the file)
+            got += k;
+        }
+    }
+
+    void read_misses(int64_t& nruns, int64_t& bytes, int64_t& blocks)
+    {
+        build_runs(blocks);
+        nruns = (int64_t) runs_.size();
+        bytes = 0;
+        for (auto& r : runs_) bytes += r.len;
+        if (backend_ == AIO) read_aio();
+        else read_pool();
+    }
+
+    void read_aio()
+    {
+        const int64_t n = (int64_t) runs_.size();
+        std::vector<iocb> cbs(qd_);
+        std::vector<iocb*> ptrs(qd_);
+        std::vector<int> free_slots;
+        for (int i = qd_ - 1; i >= 0; --i) free_slots.push_back(i);
+        std::vector<io_event> ev(qd_);
+        int64_t next = 0, inflight = 0;
+        while (next < n || inflight > 0)
+        {
+            int k = 0;
+            while (next < n && !free_slots.empty())
+            {
+                int q = free_slots.back(); free_slots.pop_back();
+                iocb& cb = cbs[q];
+                memset(&cb, 0, sizeof(cb));
+                cb.aio_fildes = fd_;
+                cb.aio_lio_opcode = IOCB_CMD_PREAD;
+                cb.aio_buf = (uint64_t) (bounce_ + (size_t) q * max_run_);
+                cb.aio_nbytes = runs_[next].len;
+                cb.aio_offset = runs_[next].off;
+                cb.aio_data = ((uint64_t) q << 40) | (uint64_t) next;
+                ptrs[k++] = &cb;
+                next++;
+            }
+            int sub = 0;
+            while (sub < k)
+            {
+                long r = syscall(SYS_io_submit, aio_ctx_, (long) (k - sub), ptrs.data() + sub);
+                if (r < 0) { if (errno == EAGAIN || errno == EINTR) continue; throw std::runtime_error(std::string("ngram_nvme: io_submit: ") + strerror(errno)); }
+                sub += (int) r;
+            }
+            inflight += k;
+            if (inflight == 0) break;
+            long got = syscall(SYS_io_getevents, aio_ctx_, 1L, (long) qd_, ev.data(), nullptr);
+            if (got < 0) { if (errno == EINTR) continue; throw std::runtime_error(std::string("ngram_nvme: io_getevents: ") + strerror(errno)); }
+            for (long e = 0; e < got; ++e)
+            {
+                int q = (int) (ev[e].data >> 40);
+                int64_t ri = (int64_t) (ev[e].data & ((1ull << 40) - 1));
+                const Run& r = runs_[ri];
+                uint8_t* buf = bounce_ + (size_t) q * max_run_;
+                if (ev[e].res < 0) throw std::runtime_error(std::string("ngram_nvme: aio read: ") + strerror((int) -ev[e].res));
+                if (ev[e].res < r.len)
+                {
+                    // short read (EOF tail or partial): finish synchronously
+                    Run rest = r;
+                    int64_t have = ev[e].res;
+                    if (have > 0 && ((have & 4095) == 0)) { rest.off += have; rest.len -= have; read_one(rest, buf + have); }
+                    else if (have == 0 || (have & 4095)) {
+                        // non-aligned short read happens only at EOF; the rows lie inside the returned bytes
+                    }
+                }
+                scatter_run(r, buf);
+                free_slots.push_back(q);
+                inflight--;
+            }
+        }
+    }
+
+    // pread pool: workers + caller pull runs from an atomic cursor. The caller returns only after every worker has
+    // finished this generation (pool_active_ == 0), so no worker can touch the next request's runs.
+    void pool_worker(int tid)
+    {
+        uint64_t seen = 0;
+        while (true)
+        {
+            int64_t n;
+            {
+                std::unique_lock<std::mutex> g(pool_mu_);
+                pool_cv_.wait(g, [&] { return pool_quit_ || pool_gen_ != seen; });
+                if (pool_quit_) return;
+                seen = pool_gen_;
+                n = pool_n_;
+            }
+            pool_run(tid, n);
+            pool_active_.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    }
+
+    void pool_run(int tid, int64_t n)
+    {
+        uint8_t* buf = bounce_ + (size_t) tid * max_run_;
+        while (true)
+        {
+            int64_t i = pool_next_.fetch_add(1);
+            if (i >= n) break;
+            read_one(runs_[i], buf);
+            scatter_run(runs_[i], buf);
+            pool_done_.fetch_add(1);
+        }
+    }
+
+    void read_pool()
+    {
+        int64_t n = (int64_t) runs_.size();
+        pool_next_ = 0;
+        pool_done_ = 0;
+        if (threads_ > 1 && n > 1)
+        {
+            {
+                std::lock_guard<std::mutex> g(pool_mu_);
+                pool_n_ = n;
+                pool_active_.store(threads_ - 1);
+                pool_gen_++;
+            }
+            pool_cv_.notify_all();
+            pool_run(0, n);
+            while (pool_done_.load() < n || pool_active_.load(std::memory_order_acquire) > 0) _mm_pause();
+        }
+        else pool_run(0, n);
+    }
+
+    void service_loop()
+    {
+        double idle_since = now_us();
+        while (!svc_quit_)
+        {
+            uint32_t s = __atomic_load_n(ctrl_ + C_REQ, __ATOMIC_ACQUIRE);
+            if (s == last_seq_)
+            {
+                double t = now_us();
+                if (t - idle_since > spin_us_) std::this_thread::sleep_for(std::chrono::microseconds(20));
+                else _mm_pause();
+                continue;
+            }
+            double t0 = now_us();
+            uint32_t n = __atomic_load_n(ctrl_ + C_N, __ATOMIC_ACQUIRE);
+            if ((int64_t) n > cap_) { __atomic_store_n(ctrl_ + C_ERR, 3u, __ATOMIC_RELEASE); n = (uint32_t) cap_; }
+            svc_waiting_.store(true, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> g(mu_);
+                svc_waiting_.store(false, std::memory_order_release);
+                resolve_locked(req_, n, resp_, true);
+                if (!log_.empty()) log_.back() = (int64_t) ((now_us() - t0) * 1000);
+            }
+            flush_lines(resp_, (size_t) n * sizeof(int64_t));
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            __atomic_store_n(ctrl_ + C_DONE, s, __ATOMIC_RELEASE);
+            flush_lines(ctrl_ + C_DONE, 4);
+            last_seq_ = s;
+            idle_since = now_us();
+        }
+    }
+
+    // config
+    int64_t row_bytes_, nslots_;
+    int backend_, threads_, qd_;
+    int64_t max_run_, merge_gap_, cap_;
+    int64_t warm_chunk_ = 256;
+    std::atomic<bool> svc_waiting_{false};
+    bool dry_ = false;
+    std::vector<Extent> ext_;
+    int64_t num_rows_ = 0;
+    int fd_ = -1;
+    aio_context_t aio_ctx_ = 0;
+    // cache
+    int32_t* map_ = nullptr;
+    int32_t* slot_row_ = nullptr;
+    uint8_t* ref_ = nullptr;
+    uint32_t* epoch_ = nullptr;
+    uint32_t cur_epoch_ = 0, svc_epoch_ = 0;
+    int64_t hand_ = 0;
+    uint8_t* slab_ = nullptr;
+    size_t slab_bytes_ = 0;
+    // io buffers
+    size_t io_bytes_ = 0;
+    int64_t* req_ = nullptr;
+    int64_t* resp_ = nullptr;
+    uint32_t* ctrl_ = nullptr;
+    uint8_t* bounce_ = nullptr;
+    int nbounce_ = 0;
+    std::vector<Miss> misses_;
+    std::vector<Run> runs_;
+    std::mutex mu_;
+    // pool
+    std::vector<std::thread> pool_;
+    std::mutex pool_mu_;
+    std::condition_variable pool_cv_;
+    uint64_t pool_gen_ = 0;
+    bool pool_quit_ = false;
+    std::atomic<int64_t> pool_next_{0}, pool_done_{0};
+    std::atomic<int> pool_active_{0};
+    int64_t pool_n_ = 0;
+    // service
+    std::thread svc_;
+    std::atomic<bool> svc_quit_{false};
+    double spin_us_ = 200000;
+    uint32_t last_seq_ = 0;
+    // stats
+    int64_t st_requests_ = 0, st_lookups_ = 0, st_unique_ = 0, st_hits_ = 0, st_misses_ = 0, st_runs_ = 0, st_bytes_ = 0,
+            st_blocks_ = 0, st_resident_ = 0, st_warm_lookups_ = 0, st_warm_misses_ = 0, st_warm_bytes_ = 0;
+    double st_io_us_ = 0, st_resolve_us_ = 0, st_warm_us_ = 0;
+    std::vector<int64_t> log_;
+};
+
+} // namespace
+
+// ---------------------------------------------------------------------------------------------------------------
+// n-gram hash on the CPU (same as SGLang Qwen4ExpNGramEmbedding._hash_contexts / exllamav3 ngram_hash_cpu):
+// tokens [L] with the preceding (ngram_size-1)=2 history tokens prepended (eos at a sequence start);
+// out [L-2, H] row ids. Bigram heads first, then trigram heads. eos segmentation: an n-gram never crosses an eos.
+void ngram_hash_tokens(torch::Tensor tokens, torch::Tensor mult, torch::Tensor sizes, torch::Tensor offsets,
+                       int64_t heads_per_ngram, int64_t eos, torch::Tensor out)
+{
+    TORCH_CHECK(tokens.is_cpu() && tokens.scalar_type() == at::kLong && tokens.is_contiguous(), "hash: tokens");
+    const int64_t* t = tokens.data_ptr<int64_t>();
+    const int64_t* m = mult.data_ptr<int64_t>();
+    const int64_t* sz = sizes.data_ptr<int64_t>();
+    const int64_t* of = offsets.data_ptr<int64_t>();
+    int64_t L = tokens.numel() - 2;
+    int64_t H = 2 * heads_per_ngram;
+    TORCH_CHECK(mult.numel() == 3 && sizes.numel() == H && offsets.numel() == H, "hash: only ngram_size 3");
+    TORCH_CHECK(out.numel() >= L * H && out.scalar_type() == at::kLong, "hash: out");
+    int64_t* o = out.data_ptr<int64_t>();
+    for (int64_t p = 0; p < L; ++p)
+    {
+        int64_t a = t[p + 2], b = t[p + 1];
+        int64_t c = (b == eos) ? eos : t[p];
+        int64_t bi = (int64_t) ((uint64_t) a * (uint64_t) m[0] ^ (uint64_t) b * (uint64_t) m[1]);
+        int64_t tri = (int64_t) ((uint64_t) bi ^ (uint64_t) c * (uint64_t) m[2]);
+        for (int64_t h = 0; h < heads_per_ngram; ++h) o[p * H + h] = pyrem(bi, sz[h]) + of[h];
+        for (int64_t h = heads_per_ngram; h < H; ++h) o[p * H + h] = pyrem(tri, sz[h]) + of[h];
+    }
+}
+
+// XPU entry points (raw pointers are USM host addresses; kernels on the current torch XPU stream).
+// Every GPU access to the shared host words is a system-scope atomic RMW: plain / atomic loads and stores to host USM
+// can sit in the GPU L3 between kernels of one in-order queue (no flush without a host-visible event), which hung the
+// back-to-back publish -> wait pair (host never saw req_seq) and could serve stale resp lines on graph replay.
+void nvme_publish(const at::Tensor& ids, int64_t req_dev, int64_t ctrl_dev, at::Tensor& dseq)
+{
+    TORCH_CHECK(ids.is_xpu() && ids.is_contiguous(), "nvme_publish: ids");
+    TORCH_CHECK(dseq.is_xpu() && dseq.scalar_type() == at::kInt, "nvme_publish: dseq");
+    int n = (int) ids.numel();
+    auto& q = c10::xpu::getCurrentXPUStream(ids.device().index()).queue();
+    int64_t* req = (int64_t*) req_dev;
+    if (n > 0)
+    {
+        size_t g = ((size_t) n + 255) / 256 * 256;
+        if (ids.scalar_type() == at::kLong) {
+            const int64_t* p = ids.data_ptr<int64_t>();
+            q.parallel_for(sycl::nd_range<1>(g, 256), [=](sycl::nd_item<1> it) {
+                int i = it.get_global_id(0); if (i < n) sycl::atomic_ref<int64_t, sycl::memory_order::relaxed, sycl::memory_scope::system,
+                    sycl::access::address_space::global_space>(req[i]).exchange(p[i]);
+                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system); });
+        } else if (ids.scalar_type() == at::kInt) {
+            const int32_t* p = ids.data_ptr<int32_t>();
+            q.parallel_for(sycl::nd_range<1>(g, 256), [=](sycl::nd_item<1> it) {
+                int i = it.get_global_id(0); if (i < n) sycl::atomic_ref<int64_t, sycl::memory_order::relaxed, sycl::memory_scope::system,
+                    sycl::access::address_space::global_space>(req[i]).exchange((int64_t) p[i]);
+                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system); });
+        } else TORCH_CHECK(false, "nvme_publish: ids int32/int64");
+    }
+    uint32_t* ctrl = (uint32_t*) ctrl_dev;
+    uint32_t* ds = (uint32_t*) dseq.data_ptr<int>();
+    q.single_task([=]() {
+        uint32_t s = ds[0] + 1;
+        ds[0] = s;
+        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::system,
+                         sycl::access::address_space::global_space>(ctrl[C_N]).exchange((uint32_t) n);
+        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::system,
+                         sycl::access::address_space::global_space>(ctrl[C_REQ]).exchange(s, sycl::memory_order::acq_rel);
+    });
+}
+
+// Host -> GPU direction: a system-scope atomic (even an RMW) spinning inside one kernel never observed the host's
+// done_seq store on B70 (served from the GPU cache; 400k iterations, 2.2 us each, past the host write).  The spin and
+// the resp read therefore use ESIMD LSC loads with L1+L3 uncached hints, which go to host memory every time.
+namespace esn = sycl::ext::intel::esimd;
+namespace xe = sycl::ext::intel::experimental::esimd;
+struct NvmeSpinK {
+    const uint32_t* ctrl; const uint32_t* ds; int64_t* scratch; int64_t max_it;
+    void operator()(sycl::nd_item<1>) const SYCL_ESIMD_KERNEL {
+        esn::simd<uint32_t, 1> z(0);
+        uint32_t s = xe::lsc_gather<uint32_t, 1, xe::lsc_data_size::default_size, xe::cache_hint::uncached,
+                                    xe::cache_hint::uncached>(ds, z)[0];
+        int64_t it = 0;
+        while (true) {
+            // invalidating system fence: also keeps the compiler from hoisting the load out of the loop
+            esn::fence<esn::memory_kind::global, esn::fence_flush_op::invalidate, esn::fence_scope::system>();
+            uint32_t d = xe::lsc_gather<uint32_t, 1, xe::lsc_data_size::default_size, xe::cache_hint::uncached,
+                                        xe::cache_hint::uncached>(ctrl + C_DONE, z)[0];
+            if ((int32_t) (d - s) >= 0) break;
+            uint32_t a = xe::lsc_gather<uint32_t, 1, xe::lsc_data_size::default_size, xe::cache_hint::uncached,
+                                        xe::cache_hint::uncached>(ctrl + C_ABORT, z)[0];
+            if (a) { it = -1 - it; break; }
+            if (++it > max_it) break;
+        }
+        esn::simd<int64_t, 1> v(it);
+        xe::lsc_scatter<int64_t, 1, xe::lsc_data_size::default_size, xe::cache_hint::uncached,
+                        xe::cache_hint::uncached>(scratch, z, v);
+    }
+};
+struct NvmeRespK {
+    const int64_t* resp; int64_t* sl; int n;
+    void operator()(sycl::nd_item<1> item) const SYCL_ESIMD_KERNEL {
+        int base = (int) item.get_global_id(0) * 16;
+        esn::simd<uint32_t, 16> off(0, 8);
+        esn::simd_mask<16> m = esn::simd<int32_t, 16>(base, 1) < n;
+        esn::simd<int64_t, 16> v = xe::lsc_gather<int64_t, 1, xe::lsc_data_size::default_size, xe::cache_hint::uncached,
+                                                  xe::cache_hint::uncached, 16>(resp + base, off, m);
+        xe::lsc_scatter<int64_t, 1, xe::lsc_data_size::default_size, xe::cache_hint::none, xe::cache_hint::none, 16>(
+            sl + base, off, v, m);
+    }
+};
+
+void nvme_wait(int64_t ctrl_dev, const at::Tensor& dseq, at::Tensor& stall, int64_t resp_dev, at::Tensor& slots,
+               int64_t n, int64_t timeout_ns)
+{
+    TORCH_CHECK(stall.is_xpu() && stall.scalar_type() == at::kLong && stall.numel() >= 4, "nvme_wait: stall");
+    TORCH_CHECK(slots.is_xpu() && slots.scalar_type() == at::kLong && slots.numel() >= n, "nvme_wait: slots");
+    auto& q = c10::xpu::getCurrentXPUStream(slots.device().index()).queue();
+    uint32_t* ctrl = (uint32_t*) ctrl_dev;
+    const uint32_t* ds = (const uint32_t*) dseq.data_ptr<int>();
+    int64_t* st = stall.data_ptr<int64_t>();
+    // no device clock in SYCL: bound the spin by iterations (~2 us each: invalidating fence + uncached host load)
+    int64_t max_it = std::max<int64_t>(timeout_ns / 2000, 1000);
+    q.parallel_for(sycl::nd_range<1>(1, 1), NvmeSpinK{ctrl, ds, st + 3, max_it});
+    q.single_task([=]() {
+        int64_t it = st[3];
+        if (it < 0) { ctrl[C_ERR] = 2; it = -1 - it; }
+        else if (it > max_it) ctrl[C_ERR] = 1;
+        st[0] += it;           // XPU: spin iterations instead of ns
+        st[1] += 1;
+        if (it > st[2]) st[2] = it;
+    });
+    if (n > 0)
+    {
+        size_t g = (((size_t) n + 15) / 16 + 15) / 16 * 16;
+        q.parallel_for(sycl::nd_range<1>(g, 16), NvmeRespK{(const int64_t*) resp_dev, slots.data_ptr<int64_t>(), (int) n});
+    }
+}
+
+void host_flush(int64_t ptr, int64_t bytes) { flush_lines((const void*) ptr, (size_t) bytes); }
+int64_t host_register(int64_t ptr, int64_t bytes) { return ptr; }     // USM host: already device-visible
+void host_unregister(int64_t ptr) {}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+{
+    py::class_<RowStore>(m, "RowStore")
+        .def(py::init<const std::string&, std::vector<int64_t>, std::vector<int64_t>, std::vector<int64_t>, int64_t,
+                      int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>())
+        .def("close", &RowStore::close)
+        .def("release_memory", &RowStore::release_memory)
+        .def("slab_ptr", &RowStore::slab_ptr)
+        .def("slab_bytes", &RowStore::slab_bytes)
+        .def("req_ptr", &RowStore::req_ptr)
+        .def("resp_ptr", &RowStore::resp_ptr)
+        .def("io_bytes", &RowStore::io_bytes)
+        .def("ctrl_ptr", &RowStore::ctrl_ptr)
+        .def("num_rows", &RowStore::num_rows)
+        .def("nslots", &RowStore::nslots)
+        .def("resolve", &RowStore::resolve_tensor, py::call_guard<py::gil_scoped_release>())
+        .def("warm", &RowStore::warm_tensor, py::call_guard<py::gil_scoped_release>())
+        .def("set_warm_chunk", &RowStore::set_warm_chunk)
+        .def("set_dry", &RowStore::set_dry)
+        .def("read_slots", &RowStore::read_slots)
+        .def("start_service", &RowStore::start_service)
+        .def("stop_service", &RowStore::stop_service, py::call_guard<py::gil_scoped_release>())
+        .def("counters", &RowStore::counters)
+        .def("reset_counters", &RowStore::reset_counters)
+        .def("request_log", &RowStore::request_log)
+        .def("drop_cache", &RowStore::drop_cache);
+    m.def("ngram_hash_tokens", &ngram_hash_tokens);
+    m.def("nvme_publish", &nvme_publish);
+    m.def("nvme_wait", &nvme_wait);
+    m.def("host_flush", &host_flush);
+    m.def("host_register", &host_register);
+    m.def("host_unregister", &host_unregister);
+}

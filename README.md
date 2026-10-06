@@ -76,6 +76,25 @@ Masked expert picks rise from 4–12 to ~32–38 per decode step, about 7% of pi
 approximation, so it stays off by default until the decode quality gate passes. The fix that keeps exact output (an
 async victim ring drained by the copy engine) is in progress.
 
+## Experimental (validated standalone, not yet in the server)
+
+| folder | what | status |
+|---|---|---|
+| [`experimental/n111-victim-ring`](experimental/n111-victim-ring/) | decode kernel parks VRAM victims in a VRAM ring (µs) instead of storing to host (~0.9 ms each). Host drains the ring through pinned staging, and only the host sets the RAM-resident flag (`_moe_a9`/`a9b` patches, `VRING=1`) | bit-exact 72/72 calls; stress simulation 0 mismatches; +0.2–0.5 ms/step vs +9–30 ms for today's write-back |
+| [`experimental/n112-gdn`](experimental/n112-gdn/) | SYCL token-serial GDN prefill recurrence ported from Strata (MIT), drop-in for SGLang's `chunk_gated_delta_rule` extend call (`EXL3_GDN_SYCL=1`) | CPU-validated against fp64: output rel 1.66e-3, final state 4e-9, chunk continuation bit-identical. GPU test pending |
+| [`experimental/n114-decode`](experimental/n114-decode/) | fused decode kernels from Strata: GDN step (6–7 → 2 kernels/layer), hyper-connection read (~7 → 3–4/half), decode QSA (~45 → 2/layer), graph-safe | builds; CPU tests pass. GPU test pending |
+| [`experimental/n113-mtp`](experimental/n113-mtp/) | MTP self-speculation (SGLang NEXTN) in tier mode: MTP experts pinned in VRAM, safe verify rows | plan + plugin override written; projected 32–43 tok/s exact at 1 stream. Not run yet |
+
+## Known issues
+
+- **Write-back race in the default tier path.** In a stress simulation (N111), the decode kernel's direct victim
+  write-back produced 50–52 mismatched output rows and 8–10 bad RAM pages. The GPU marks a written-back expert
+  resident while the host still has that page queued for punching. The victim ring removes the race because only the
+  host sets the flag. Until it lands, treat long greedy runs on the default path with care. Runaway generations were
+  observed once in the exact config.
+- **Hardware.** On the test box, PCIe links are marginal under load. Both B70s dropped off the bus once on 2026-10-06,
+  and the box needed a BMC power cycle. None of the measurements above were taken during a fault window.
+
 ## Hardware used
 
 | part | detail |

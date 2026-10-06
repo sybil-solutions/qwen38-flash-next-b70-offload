@@ -1,0 +1,4 @@
+docker: Error response from daemon: error gathering device information while adding custom device "/dev/dri/renderD130": no such file or directory
+
+Run 'docker run --help' for more information
+docker rc=127
