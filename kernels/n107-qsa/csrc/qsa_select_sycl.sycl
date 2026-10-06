@@ -1,0 +1,293 @@
+// N108: QSA prefill block selection on Intel Xe2 (Arc Pro B70): fused indexer scores + exact radix top-k per row,
+// torch.ops.n108qsa.prefill_scores / prefill_select. Drop-in for SGLang torch_qsa_mqa_prefill + exl3xpu qsa_fast_topk:
+//   logits[r, n] = sum_h relu(q[r, h] . k[n]) / score_div      (fp32 dots of bf16 values; score_div = sqrt(D))
+//   for n in [row_starts[r], row_ends[r]); top-k by value, ties at the threshold -> lowest index (Strata's rule);
+//   output: selected block indices relative to row_starts[r] in ascending order, then -1 (valid-first layout).
+//
+// Structure ported from Strata (github.com/Niko1221/Strata, MIT; sycl/src/kernels/cuda/qsa_select.dp.cpp:
+// block_scores_kernel and block_topk_reg_kernel / qsa_block_topk), adapted to this server's indexer (4 heads x 128,
+// bf16 q and compressed keys, plain relu-sum logits, no tail-block bonus, block-count budget):
+//   * scores: lane-per-block (the key of one compressed block per lane, held as packed bf16 in registers), q of a
+//     few rows in SLM, broadcast lane by lane; a work-group covers 256 blocks x RPW rows;
+//   * top-k: one work-group per row, 8-bit radix passes over the orderable keys (histograms in SLM), then the exact
+//     selection > threshold plus the first (lowest-index) ties, positions from a work-group exclusive scan.
+//
+// MIT License
+//
+// Copyright (c) 2026 Niko1221 and the Strata contributors
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+#ifndef N108_NO_TORCH
+#include <torch/all.h>
+#include <torch/library.h>
+#include <c10/xpu/XPUStream.h>
+#endif
+#include <sycl/sycl.hpp>
+
+#include <cfloat>
+#include <cstdint>
+
+namespace n108sel {
+
+constexpr int SG = 16;
+constexpr int WG = 256;          // blocks per score work-group (lane = block), threads per top-k work-group
+constexpr int ID = 128;          // indexer head dim
+constexpr int IH = 4;            // indexer heads
+
+static inline uint32_t order_key(float s) {   // ascending with s; -0 == +0 like float compares (never NaN here)
+    const uint32_t b = sycl::bit_cast<uint32_t>(s + 0.0f);
+    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+
+// scores[r, n - row_starts[r]] for n in [row_starts[r], row_ends[r]); RPW rows per work-group
+template <int RPW>
+struct ScoreKernel {
+    const uint16_t* q; int64_t qs0, qs1;   // bf16 bits [R, IH, ID]
+    const uint16_t* k; int64_t ks0;        // bf16 bits [C, ID]
+    const int32_t* starts; const int32_t* ends;
+    float* scores; int64_t sstride;        // [R, sstride] fp32
+    int R, C; float inv_div;
+    sycl::local_accessor<float, 3> sq;     // [RPW][IH][ID]
+    sycl::local_accessor<int32_t, 1> srng; // [2 * RPW]
+
+    [[sycl::reqd_sub_group_size(SG)]] void operator()(sycl::nd_item<2> it) const {
+        const int r0 = it.get_group(0) * RPW;
+        const int n0 = it.get_group(1) * WG;
+        const int t = it.get_local_id(1);
+        auto g = it.get_group();
+        auto sg = it.get_sub_group();
+        const int lane = sg.get_local_id()[0];
+        if (t < RPW) {
+            const int r = r0 + t;
+            srng[t] = r < R ? starts[r] : 0;
+            srng[RPW + t] = r < R ? ends[r] : 0;
+        }
+        for (int i = t; i < RPW * IH * ID; i += WG) {
+            const int rr = i / (IH * ID), h = (i / ID) % IH, d = i % ID;
+            const int r = r0 + rr;
+            sq[rr][h][d] = r < R ? sycl::bit_cast<float>((uint32_t)q[(size_t)r * qs0 + (size_t)h * qs1 + d] << 16) : 0.0f;
+        }
+        sycl::group_barrier(g);
+        int lo = srng[0], hi = srng[RPW];
+#pragma unroll
+        for (int rr = 1; rr < RPW; ++rr) { lo = sycl::min(lo, srng[rr]); hi = sycl::max(hi, srng[RPW + rr]); }
+        if (n0 + WG <= lo || n0 >= hi) return;                  // uniform: no row of this tile reads these blocks
+        const int n = n0 + t;
+        // this lane's key, packed bf16 pairs
+        uint32_t kw[ID / 2];
+        const uint32_t* kp = reinterpret_cast<const uint32_t*>(k + (size_t)sycl::min(n, C - 1) * ks0);
+#pragma unroll
+        for (int i = 0; i < ID / 8; ++i) {
+            const sycl::vec<uint32_t, 4> w = reinterpret_cast<const sycl::vec<uint32_t, 4>*>(kp)[i];
+            kw[4 * i] = w[0]; kw[4 * i + 1] = w[1]; kw[4 * i + 2] = w[2]; kw[4 * i + 3] = w[3];
+        }
+        for (int rr = 0; rr < RPW; ++rr) {
+            const int r = r0 + rr;
+            const int s = srng[rr], e = srng[RPW + rr];
+            if (sycl::none_of_group(sg, n >= s && n < e)) continue;   // per sub-group
+            float acc[IH];
+#pragma unroll
+            for (int h = 0; h < IH; ++h) acc[h] = 0.0f;
+#pragma unroll
+            for (int db = 0; db < ID; db += SG) {
+                float qv[IH];
+#pragma unroll
+                for (int h = 0; h < IH; ++h) qv[h] = sq[rr][h][db + lane];
+#pragma unroll
+                for (int j = 0; j < SG; j += 2) {
+                    const uint32_t w = kw[(db + j) / 2];
+                    const float k0 = sycl::bit_cast<float>(w << 16), k1 = sycl::bit_cast<float>(w & 0xFFFF0000u);
+#pragma unroll
+                    for (int h = 0; h < IH; ++h) {
+                        acc[h] = sycl::fma(k0, sycl::group_broadcast(sg, qv[h], j), acc[h]);
+                        acc[h] = sycl::fma(k1, sycl::group_broadcast(sg, qv[h], j + 1), acc[h]);
+                    }
+                }
+            }
+            if (n >= s && n < e) {
+                const float sc = ((sycl::fmax(acc[0], 0.0f) + sycl::fmax(acc[1], 0.0f)) + sycl::fmax(acc[2], 0.0f) +
+                                  sycl::fmax(acc[3], 0.0f)) * inv_div;
+                scores[(size_t)r * sstride + (n - s)] = sc;
+            }
+        }
+    }
+};
+
+// one work-group per row: exact top-k over scores[r, 0:len), len = ends[r] - starts[r]
+struct TopkKernel {
+    const float* scores; int64_t sstride;
+    const int32_t* starts; const int32_t* ends;
+    int32_t* out; int topk;
+    sycl::local_accessor<int, 1> hist;     // [256]
+    sycl::local_accessor<int, 1> sc;       // [4]
+
+    [[sycl::reqd_sub_group_size(SG)]] void operator()(sycl::nd_item<1> it) const {
+        const int r = it.get_group(0), t = it.get_local_id(0);
+        auto g = it.get_group();
+        const int len = sycl::max(0, ends[r] - starts[r]);
+        int32_t* o = out + (size_t)r * topk;
+        if (len <= topk) {                                       // everything is selected, ascending
+            for (int j = t; j < topk; j += WG) o[j] = j < len ? j : -1;
+            return;
+        }
+        const float* s = scores + (size_t)r * sstride;
+        const int per = (len + WG - 1) / WG, c0 = sycl::min(len, t * per), c1 = sycl::min(len, c0 + per);
+        using lref = sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                      sycl::access::address_space::local_space>;
+        uint32_t prefix = 0;
+        int above = 0;                                           // keys strictly above the fixed digits
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            hist[t] = 0;
+            sycl::group_barrier(g);
+            const uint32_t hmask = shift == 24 ? 0u : (0xFFFFFFFFu << (shift + 8));
+            int rb = -1, rn = 0;
+            for (int j = c0; j < c1; ++j) {
+                const uint32_t u = order_key(s[j]);
+                if ((u & hmask) != (prefix & hmask)) continue;
+                const int bb = (u >> shift) & 255;
+                if (bb != rb) { if (rn) lref(hist[rb]).fetch_add(rn); rb = bb; rn = 0; }
+                ++rn;
+            }
+            if (rn) lref(hist[rb]).fetch_add(rn);
+            sycl::group_barrier(g);
+            // digit d: the largest with above + #(digit > d) + #(digit == d) >= topk, scanning from the top
+            const int c = hist[255 - t];                         // thread t holds digit 255 - t (descending)
+            const int cum = sycl::exclusive_scan_over_group(g, c, sycl::plus<int>());   // # with digit > 255 - t
+            if (above + cum < topk && above + cum + c >= topk) { sc[0] = 255 - t; sc[1] = above + cum; }
+            sycl::group_barrier(g);
+            prefix |= (uint32_t)sc[0] << shift;
+            above = sc[1];
+            sycl::group_barrier(g);
+        }
+        const uint32_t thr = prefix;
+        const int eq_budget = topk - above;                      // ties to take, lowest index first
+        int gt = 0, eq = 0;
+        for (int j = c0; j < c1; ++j) {
+            const uint32_t u = order_key(s[j]);
+            gt += u > thr;
+            eq += u == thr;
+        }
+        const int eq_before = sycl::exclusive_scan_over_group(g, eq, sycl::plus<int>());
+        const int my_eq = sycl::clamp(eq_budget - eq_before, 0, eq);
+        int wpos = sycl::exclusive_scan_over_group(g, gt + my_eq, sycl::plus<int>());
+        int eq_left = my_eq;
+        for (int j = c0; j < c1; ++j) {
+            const uint32_t u = order_key(s[j]);
+            if (u > thr) o[wpos++] = j;
+            else if (u == thr && eq_left > 0) { o[wpos++] = j; --eq_left; }
+        }
+    }
+};
+
+template <int RPW>
+static void launch_scores(sycl::queue& q, const uint16_t* qp, int64_t qs0, int64_t qs1, const uint16_t* kp, int64_t ks0,
+                          const int32_t* st, const int32_t* en, float* scores, int64_t sstride, int R, int C,
+                          float inv_div) {
+    q.submit([&](sycl::handler& h) {
+        ScoreKernel<RPW> k{qp, qs0, qs1, kp, ks0, st, en, scores, sstride, R, C, inv_div,
+                           sycl::local_accessor<float, 3>(sycl::range<3>(RPW, IH, ID), h),
+                           sycl::local_accessor<int32_t, 1>(sycl::range<1>(2 * RPW), h)};
+        h.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t)(R + RPW - 1) / RPW, (size_t)((C + WG - 1) / WG) * WG),
+                                         sycl::range<2>(1, WG)), k);
+    });
+}
+
+static void launch_topk(sycl::queue& q, const float* scores, int64_t sstride, const int32_t* st, const int32_t* en,
+                        int32_t* out, int topk, int R) {
+    q.submit([&](sycl::handler& h) {
+        TopkKernel k{scores, sstride, st, en, out, topk, sycl::local_accessor<int, 1>(sycl::range<1>(256), h),
+                     sycl::local_accessor<int, 1>(sycl::range<1>(4), h)};
+        h.parallel_for(sycl::nd_range<1>((size_t)R * WG, WG), k);
+    });
+}
+
+#ifndef N108_NO_TORCH
+static sycl::queue& queue_of(const at::Tensor& t) { return c10::xpu::getCurrentXPUStream(t.device().index()).queue(); }
+
+static void check_inputs(const at::Tensor& q, const at::Tensor& k, const at::Tensor& st, const at::Tensor& en) {
+    TORCH_CHECK(q.is_xpu() && k.is_xpu() && st.is_xpu() && en.is_xpu(), "n108qsa select: XPU tensors");
+    TORCH_CHECK(q.scalar_type() == at::kBFloat16 && k.scalar_type() == at::kBFloat16, "n108qsa select: bf16 q / keys");
+    TORCH_CHECK(q.dim() == 3 && q.size(1) == IH && q.size(2) == ID && q.stride(2) == 1, "n108qsa select: q [R, 4, 128]");
+    TORCH_CHECK(k.dim() == 2 && k.size(1) == ID && k.stride(1) == 1 && k.stride(0) % 8 == 0 &&
+                reinterpret_cast<uintptr_t>(k.data_ptr()) % 16 == 0, "n108qsa select: keys [C, 128] 16-byte rows");
+    TORCH_CHECK(st.scalar_type() == at::kInt && en.scalar_type() == at::kInt && st.is_contiguous() && en.is_contiguous() &&
+                st.numel() == q.size(0) && en.numel() == q.size(0), "n108qsa select: int32 row ranges");
+}
+
+// logits [R, C] relative to row starts (columns >= len are left unwritten); for tests
+at::Tensor prefill_scores(at::Tensor q, at::Tensor k, at::Tensor starts, at::Tensor ends, double score_div, int64_t rpw) {
+    check_inputs(q, k, starts, ends);
+    const int R = q.size(0), C = k.size(0);
+    auto scores = at::full({R, std::max(C, 1)}, -INFINITY, q.options().dtype(at::kFloat));
+    if (R == 0 || C == 0) return scores;
+    auto& qu = queue_of(q);
+    auto qp = reinterpret_cast<const uint16_t*>(q.data_ptr());
+    auto kp = reinterpret_cast<const uint16_t*>(k.data_ptr());
+    const float inv = (float)(1.0 / score_div);
+    if (rpw == 4) launch_scores<4>(qu, qp, q.stride(0), q.stride(1), kp, k.stride(0), starts.data_ptr<int32_t>(),
+                                   ends.data_ptr<int32_t>(), scores.data_ptr<float>(), C, R, C, inv);
+    else if (rpw == 16) launch_scores<16>(qu, qp, q.stride(0), q.stride(1), kp, k.stride(0), starts.data_ptr<int32_t>(),
+                                          ends.data_ptr<int32_t>(), scores.data_ptr<float>(), C, R, C, inv);
+    else launch_scores<8>(qu, qp, q.stride(0), q.stride(1), kp, k.stride(0), starts.data_ptr<int32_t>(),
+                          ends.data_ptr<int32_t>(), scores.data_ptr<float>(), C, R, C, inv);
+    return scores;
+}
+
+// block indices [R, topk] int32 (relative to starts, ascending, then -1); rows processed in batches whose fp32 score
+// scratch fits scratch_mb
+at::Tensor prefill_select(at::Tensor q, at::Tensor k, at::Tensor starts, at::Tensor ends, int64_t topk, double score_div,
+                          int64_t rpw, int64_t scratch_mb) {
+    check_inputs(q, k, starts, ends);
+    const int R = q.size(0), C = k.size(0);
+    TORCH_CHECK(topk > 0, "n108qsa select: topk");
+    auto out = at::empty({R, topk}, q.options().dtype(at::kInt));
+    if (R == 0) return out;
+    if (C == 0) { out.fill_(-1); return out; }
+    const int64_t budget = (scratch_mb > 0 ? scratch_mb : 128) << 20;
+    const int RB = (int)std::max<int64_t>(1, std::min<int64_t>(R, budget / ((int64_t)C * 4)));
+    auto scratch = at::empty({(int64_t)RB, C}, q.options().dtype(at::kFloat));
+    auto& qu = queue_of(q);
+    const float inv = (float)(1.0 / score_div);
+    for (int r0 = 0; r0 < R; r0 += RB) {
+        const int n = std::min(RB, R - r0);
+        auto qp = reinterpret_cast<const uint16_t*>(q.data_ptr()) + (size_t)r0 * q.stride(0);
+        auto kp = reinterpret_cast<const uint16_t*>(k.data_ptr());
+        const int32_t* st = starts.data_ptr<int32_t>() + r0;
+        const int32_t* en = ends.data_ptr<int32_t>() + r0;
+        if (rpw == 4) launch_scores<4>(qu, qp, q.stride(0), q.stride(1), kp, k.stride(0), st, en, scratch.data_ptr<float>(), C, n, C, inv);
+        else if (rpw == 16) launch_scores<16>(qu, qp, q.stride(0), q.stride(1), kp, k.stride(0), st, en, scratch.data_ptr<float>(), C, n, C, inv);
+        else launch_scores<8>(qu, qp, q.stride(0), q.stride(1), kp, k.stride(0), st, en, scratch.data_ptr<float>(), C, n, C, inv);
+        launch_topk(qu, scratch.data_ptr<float>(), C, st, en, out.data_ptr<int32_t>() + (size_t)r0 * topk, (int)topk, n);
+    }
+    return out;
+}
+#endif
+
+}  // namespace n108sel
+
+#ifndef N108_NO_TORCH
+TORCH_LIBRARY_FRAGMENT(n108qsa, m) {
+    m.def("prefill_scores(Tensor q, Tensor k, Tensor starts, Tensor ends, float score_div, int rpw) -> Tensor");
+    m.impl("prefill_scores", torch::kXPU, &n108sel::prefill_scores);
+    m.def("prefill_select(Tensor q, Tensor k, Tensor starts, Tensor ends, int topk, float score_div, int rpw, "
+          "int scratch_mb) -> Tensor");
+    m.impl("prefill_select", torch::kXPU, &n108sel::prefill_select);
+}
+#endif

@@ -1,0 +1,131 @@
+[
+ {
+  "case": "d2h_usm",
+  "mode": "batch",
+  "rep": 0,
+  "ms_per_blob": 0.2122,
+  "GBps": 8.78
+ },
+ {
+  "case": "d2h_usm",
+  "mode": "batch",
+  "rep": 1,
+  "ms_per_blob": 0.2102,
+  "GBps": 8.86
+ },
+ {
+  "case": "d2h_usm",
+  "mode": "batch",
+  "rep": 2,
+  "ms_per_blob": 0.2103,
+  "GBps": 8.86
+ },
+ {
+  "case": "d2h_usm",
+  "mode": "single",
+  "rep": 0,
+  "ms_per_blob_median": 0.2278,
+  "ms_max": 0.348
+ },
+ {
+  "case": "d2h_usm",
+  "mode": "single",
+  "rep": 1,
+  "ms_per_blob_median": 0.295,
+  "ms_max": 0.307
+ },
+ {
+  "case": "d2h_usm",
+  "mode": "single",
+  "rep": 2,
+  "ms_per_blob_median": 0.2958,
+  "ms_max": 0.306
+ },
+ {
+  "case": "d2h_memfd_warm",
+  "mode": "batch",
+  "rep": 0,
+  "ms_per_blob": 0.3672,
+  "GBps": 5.07
+ },
+ {
+  "case": "d2h_memfd_warm",
+  "mode": "batch",
+  "rep": 1,
+  "ms_per_blob": 0.3214,
+  "GBps": 5.79
+ },
+ {
+  "case": "d2h_memfd_warm",
+  "mode": "batch",
+  "rep": 2,
+  "ms_per_blob": 0.3203,
+  "GBps": 5.81
+ },
+ {
+  "case": "d2h_memfd_warm",
+  "mode": "single",
+  "rep": 0,
+  "ms_per_blob_median": 0.4527,
+  "ms_max": 0.612
+ },
+ {
+  "case": "d2h_memfd_warm",
+  "mode": "single",
+  "rep": 1,
+  "ms_per_blob_median": 0.4039,
+  "ms_max": 0.611
+ },
+ {
+  "case": "d2h_memfd_warm",
+  "mode": "single",
+  "rep": 2,
+  "ms_per_blob_median": 0.3954,
+  "ms_max": 0.43
+ },
+ {
+  "case": "d2h_memfd_punched",
+  "mode": "batch",
+  "rep": 0,
+  "ms_per_blob": 0.4431,
+  "GBps": 4.2
+ },
+ {
+  "case": "d2h_memfd_punched",
+  "mode": "batch",
+  "rep": 1,
+  "ms_per_blob": 0.4238,
+  "GBps": 4.39
+ },
+ {
+  "case": "d2h_memfd_punched",
+  "mode": "batch",
+  "rep": 2,
+  "ms_per_blob": 0.4248,
+  "GBps": 4.38
+ },
+ {
+  "case": "d2h_memfd_punched",
+  "mode": "single",
+  "rep": 0,
+  "ms_per_blob_median": 0.5811,
+  "ms_max": 0.627
+ },
+ {
+  "case": "d2h_memfd_punched",
+  "mode": "single",
+  "rep": 1,
+  "ms_per_blob_median": 0.5918,
+  "ms_max": 0.646
+ },
+ {
+  "case": "d2h_memfd_punched",
+  "mode": "single",
+  "rep": 2,
+  "ms_per_blob_median": 0.5993,
+  "ms_max": 0.636
+ },
+ {
+  "exact_memfd": true
+ }
+]

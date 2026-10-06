@@ -1,0 +1,580 @@
+// N108: per-query split-K QSA prompt attention for Intel Xe2 (Arc Pro B70) as a torch XPU op library
+// (torch.ops.n108qsa.*), reading K/V in place from the paged pool through the physical token slots (no gather copy,
+// no union, no host sync).
+//
+// Kernel 1 ("strata") is a port of Strata's per-query QSA attention (attn_chunk_kernel + attn_merge_kernel,
+// launcher qsa_decode_attn_batch) from sycl/src/kernels/cuda/qsa_decode_attn.dp.cpp of
+// github.com/Niko1221/Strata (HEAD 82f46a8), adapted to this server's KV format and semantics:
+//   * KV pool [slots, Hk, 256] in fp8 e4m3fn (decoded in-kernel), bf16 or fp16, no scales (Strata: FP16 / INT8 /
+//     Q4_0 through a page table); the cell -> pool row map is the physical token slot itself (slot < 0 = masked);
+//   * q bf16 [rows, Hq, 256] (Strata: fp32), output bf16 [rows, Hq, 256];
+//   * softmax over each row's valid slots only, rows without any valid slot -> exact 0 (SGLang
+//     qsa_sparse_attention_reference semantics, as the union / Triton paths of n107-qsa);
+//   * chunks per work-group (cpw) is a parameter: cpw = 1 is Strata's split-K (one 64-cell chunk per work-group,
+//     log-sum-exp merge kernel); cpw = all chunks keeps one work-group per (row, kv head), online softmax across its
+//     chunks and no merge (prefill has rows x Hk work-groups, enough parallelism without split-K).
+// Kernel 2 ("bcast") keeps Strata's structure (q of one kv head's 12 query heads in SLM, chunk scores -> chunk
+// softmax -> P.V with one thread per dimension, fp32 throughout) but computes Q.K with one LANE per cell: each
+// sub-group takes SG cells, walks the 256 dimensions in blocks of SG, loads its q slice once per block and
+// broadcasts it lane by lane (no cross-lane reductions, q read from SLM once per SG cells instead of once per cell).
+// Chunk = 256 cells.
+//
+// Precision: fp32 scores, softmax (exp2 with log2(e) folded into the scale), P and accumulation; bf16 output (RNE).
+// fp8 decode: mode 0 = exact integer decode to fp32; mode 1 = bits -> fp16 (exact: every e4m3fn value / 256 is an
+// fp16 value; the 256 is folded into the q scale and the output normalisation). NaN codes (0x7f/0xff) are not
+// produced by the KV writer; they decode to finite values (480 / 448-range), like the Triton kernels.
+//
+// ---------------------------------------------------------------------------------------------------------------
+// Portions (kernel 1, the merge kernel) derived from Strata:
+//
+// MIT License
+//
+// Copyright (c) 2026 Niko1221 and the Strata contributors
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// ---------------------------------------------------------------------------------------------------------------
+
+#ifndef N108_NO_TORCH          // csrc/cpu_test.cpp includes this file without torch (OpenCL CPU device)
+#include <torch/all.h>
+#include <torch/library.h>
+#include <c10/xpu/XPUStream.h>
+#endif
+#include <sycl/sycl.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+
+#include <cfloat>
+#include <cstdint>
+
+namespace n108 {
+
+constexpr int HD = 256;            // head_dim
+constexpr int G = 12;              // query heads per kv head (24 / 2)
+constexpr int THREADS = 256;       // one thread per dimension in P.V
+constexpr float LOG2E = 1.4426950408889634f;
+constexpr float NEG = -FLT_MAX;    // masked score (finite: no inf arithmetic anywhere)
+
+// KV element modes
+enum : int { KV_BF16 = 0, KV_FP16 = 1, KV_FP8 = 2, KV_FP8H = 3 };
+
+template <int KVM> struct KVType { using T = uint16_t; };
+template <> struct KVType<KV_FP8> { using T = uint8_t; };
+template <> struct KVType<KV_FP8H> { using T = uint8_t; };
+
+// value scale of the decoded element (fp8 via fp16 decodes to value / 256)
+template <int KVM> constexpr float kv_unscale() { return KVM == KV_FP8H ? 256.0f : 1.0f; }
+
+static inline float e4m3_exact(uint32_t u) {
+    const uint32_t sign = (u & 0x80u) << 24;
+    const float normal = sycl::bit_cast<float>(sign | (((u & 0x7Fu) + 960u) << 20));   // (e + 120) << 23 | m << 20
+    const float subm = (float)(u & 7u) * 0.001953125f;                                  // m * 2^-9
+    const float sub = sycl::bit_cast<float>(sign | sycl::bit_cast<uint32_t>(subm));
+    return ((u >> 3) & 15u) ? normal : sub;
+}
+static inline float half_bits(uint32_t h) { return (float)sycl::bit_cast<sycl::half>((uint16_t)h); }
+// two e4m3fn codes in bits [0,8) and [16,24) of z -> two fp16 bit patterns (value / 256), as one 32-bit word
+static inline uint32_t e4m3x2_to_h2(uint32_t z) { return ((z & 0x00800080u) << 8) | ((z & 0x007F007Fu) << 7); }
+
+// 4 elements from one 32-bit word (fp8) / 2 elements (16-bit types)
+template <int KVM> static inline void dec_word(uint32_t w, float* o) {
+    if constexpr (KVM == KV_BF16) {
+        o[0] = sycl::bit_cast<float>(w << 16);
+        o[1] = sycl::bit_cast<float>(w & 0xFFFF0000u);
+    } else if constexpr (KVM == KV_FP16) {
+        o[0] = half_bits(w & 0xFFFFu);
+        o[1] = half_bits(w >> 16);
+    } else if constexpr (KVM == KV_FP8) {
+        o[0] = e4m3_exact(w & 255u);
+        o[1] = e4m3_exact((w >> 8) & 255u);
+        o[2] = e4m3_exact((w >> 16) & 255u);
+        o[3] = e4m3_exact(w >> 24);
+    } else {
+        const uint32_t lo = e4m3x2_to_h2((w & 0xFFu) | ((w & 0xFF00u) << 8));
+        const uint32_t hi = e4m3x2_to_h2(((w >> 16) & 0xFFu) | ((w >> 8) & 0xFF0000u));
+        o[0] = half_bits(lo & 0xFFFFu);
+        o[1] = half_bits(lo >> 16);
+        o[2] = half_bits(hi & 0xFFFFu);
+        o[3] = half_bits(hi >> 16);
+    }
+}
+template <int KVM> constexpr int per_word() { return (KVM == KV_FP8 || KVM == KV_FP8H) ? 4 : 2; }
+
+// N consecutive elements (N * sizeof(T) a multiple of 8 bytes, pointer aligned to that) -> fp32
+template <int KVM, int N> static inline void loadN(const typename KVType<KVM>::T* p, float* o) {
+    using T = typename KVType<KVM>::T;
+    constexpr int BYTES = N * (int)sizeof(T);
+    constexpr int PW = per_word<KVM>();
+    if constexpr (BYTES % 16 == 0) {
+#pragma unroll
+        for (int i = 0; i < BYTES / 16; ++i) {
+            const sycl::vec<uint32_t, 4> w = reinterpret_cast<const sycl::vec<uint32_t, 4>*>(p)[i];
+            dec_word<KVM>(w[0], o + (4 * i + 0) * PW);
+            dec_word<KVM>(w[1], o + (4 * i + 1) * PW);
+            dec_word<KVM>(w[2], o + (4 * i + 2) * PW);
+            dec_word<KVM>(w[3], o + (4 * i + 3) * PW);
+        }
+    } else {
+        static_assert(BYTES == 8, "loadN: 8 or 16k bytes");
+        const sycl::vec<uint32_t, 2> w = *reinterpret_cast<const sycl::vec<uint32_t, 2>*>(p);
+        dec_word<KVM>(w[0], o);
+        dec_word<KVM>(w[1], o + PW);
+    }
+}
+template <int KVM> static inline float load1(const typename KVType<KVM>::T* p) {
+    if constexpr (KVM == KV_BF16) return sycl::bit_cast<float>((uint32_t)*p << 16);
+    else if constexpr (KVM == KV_FP16) return half_bits(*p);
+    else if constexpr (KVM == KV_FP8) return e4m3_exact(*p);
+    else { const uint32_t u = *p; return half_bits(((u & 0x80u) << 8) | ((u & 0x7Fu) << 7)); }
+}
+
+static inline uint16_t f2bf16_bits(float x) {
+    return sycl::bit_cast<uint16_t>(sycl::ext::oneapi::bfloat16(x));   // round to nearest even
+}
+
+struct Args {
+    const uint16_t* q; int64_t qs0, qs1;        // bf16 bits [R, Hq, HD]
+    const void* k; int64_t ks0, ks1;            // [N, Hk, HD]
+    const void* v; int64_t vs0, vs1;
+    const int32_t* slots; int64_t ss0; int T;   // [R, T]
+    float qscale;                               // softmax scale * log2(e) * kv_unscale
+    float vunscale;
+    int cpw, n_split, n_chunks;
+    int row0;                                   // first row of this launch
+    uint16_t* out;                              // bf16 bits [R, Hq, HD] contiguous (n_split == 1)
+    float* pacc; float* pm; float* pl;          // split partials of this launch (n_split > 1)
+};
+
+// shared epilogue: one work-group (local row lr, kv head kvh, split) finished; acc = thread t's dimension
+template <typename It>
+static inline void finish(const Args& a, const It& it, const float* acc, const float* sm, const float* sl) {
+    const int lr = it.get_group(0), kvh = it.get_group(1), split = it.get_group(2);
+    const int Hk = it.get_group_range(1);
+    const int t = it.get_local_id(2);
+    if (a.n_split == 1) {
+        uint16_t* o = a.out + ((size_t)(a.row0 + lr) * Hk * G + (size_t)kvh * G) * HD + t;
+#pragma unroll
+        for (int h = 0; h < G; ++h) {
+            const float L = sl[h];
+            o[(size_t)h * HD] = f2bf16_bits(L > 0.0f ? acc[h] * a.vunscale / L : 0.0f);
+        }
+    } else {
+        const size_t slot = ((size_t)lr * Hk + kvh) * a.n_split + split;
+#pragma unroll
+        for (int h = 0; h < G; ++h) a.pacc[(slot * G + h) * HD + t] = acc[h];
+        if (t < G) { a.pm[slot * G + t] = sm[t]; a.pl[slot * G + t] = sl[t]; }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Kernel 1: Strata attn_chunk_kernel. Chunk of 64 cells; QK: sub-group w takes cells w, w+NW, ..., each lane holds
+// HD/SG dimensions of the cell's key, dot with the 12 q heads from SLM + sub-group reduction; chunk softmax by
+// sub-groups over heads; P.V with thread t owning dimension t for all 12 heads.
+template <int KVM, int SG, bool BIG>
+struct StrataKernel {
+    static constexpr int CH = 64;
+    static constexpr int NW = THREADS / SG;
+    static constexpr int DPL = HD / SG;
+    static constexpr int CPL = CH / SG;
+    using T = typename KVType<KVM>::T;
+    Args a;
+    sycl::local_accessor<float, 2> sq;     // [G][HD] scaled q
+    sycl::local_accessor<float, 2> sp;     // [G][CH] scores, then probabilities
+    sycl::local_accessor<int32_t, 1> srow; // [CH] slot (-1 masked)
+    sycl::local_accessor<float, 1> sst;    // [3G] running max (log2 domain), running sum, alpha
+
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        namespace sx = sycl::ext::oneapi::experimental;
+        if constexpr (BIG) return sx::properties{sycl::ext::intel::experimental::grf_size<256>, sx::sub_group_size<SG>};
+        else return sx::properties{sx::sub_group_size<SG>};
+    }
+
+    void operator()(sycl::nd_item<3> it) const {   // sub-group size SG via get(properties_tag)
+        const int lr = it.get_group(0), kvh = it.get_group(1), split = it.get_group(2);
+        const int row = a.row0 + lr;
+        const int t = it.get_local_id(2);
+        auto g = it.get_group();
+        auto sg = it.get_sub_group();
+        const int lane = sg.get_local_id()[0], warp = sg.get_group_id()[0];
+        const uint16_t* qr = a.q + (size_t)row * a.qs0 + (size_t)(kvh * G) * a.qs1;
+        for (int i = t; i < G * HD; i += THREADS)
+            sq[i / HD][i % HD] = sycl::bit_cast<float>((uint32_t)qr[(size_t)(i / HD) * a.qs1 + (i % HD)] << 16) * a.qscale;
+        if (t < G) { sst[t] = NEG; sst[G + t] = 0.0f; sst[2 * G + t] = 1.0f; }
+        float acc[G];
+#pragma unroll
+        for (int h = 0; h < G; ++h) acc[h] = 0.0f;
+        const T* kb = static_cast<const T*>(a.k) + (size_t)kvh * a.ks1;
+        const T* vb = static_cast<const T*>(a.v) + (size_t)kvh * a.vs1;
+        const int32_t* sr = a.slots + (size_t)row * a.ss0;
+        const int cb = split * a.cpw, ce = sycl::min(cb + a.cpw, a.n_chunks);
+        for (int c = cb; c < ce; ++c) {
+            const int c0 = c * CH;
+            int my = -1;
+            if (t < CH && c0 + t < a.T) my = sr[c0 + t];
+            if (t < CH) srow[t] = my;
+            const bool any = sycl::any_of_group(g, my >= 0);
+            sycl::group_barrier(g);
+            if (!any) continue;                       // uniform: nothing selected in this chunk
+            // scores
+            for (int cc = warp; cc < CH; cc += NW) {
+                const int s = srow[cc];
+                if (s < 0) { if (lane < G) sp[lane][cc] = NEG; continue; }
+                float kf[DPL];
+                loadN<KVM, DPL>(kb + (size_t)s * a.ks0 + lane * DPL, kf);
+                float mine = 0.0f;
+#pragma unroll
+                for (int h = 0; h < G; ++h) {
+                    float d = 0.0f;
+#pragma unroll
+                    for (int j = 0; j < DPL; ++j) d = sycl::fma(kf[j], sq[h][lane * DPL + j], d);
+                    d = sycl::reduce_over_group(sg, d, sycl::plus<float>());
+                    if (lane == h) mine = d;
+                }
+                if (lane < G) sp[lane][cc] = mine;
+            }
+            sycl::group_barrier(g);
+            // chunk softmax, merged into the running max / sum
+            for (int h = warp; h < G; h += NW) {
+                float sv[CPL];
+                float mx = NEG;
+#pragma unroll
+                for (int j = 0; j < CPL; ++j) { sv[j] = sp[h][lane + j * SG]; mx = sycl::fmax(mx, sv[j]); }
+                mx = sycl::reduce_over_group(sg, mx, sycl::maximum<float>());
+                const float mo = sst[h];
+                const float mn = sycl::fmax(mo, mx);
+                const float alpha = mo == NEG ? 0.0f : sycl::native::exp2(mo - mn);
+                float ls = 0.0f;
+#pragma unroll
+                for (int j = 0; j < CPL; ++j) {
+                    const float p = sv[j] == NEG ? 0.0f : sycl::native::exp2(sv[j] - mn);
+                    sp[h][lane + j * SG] = p;
+                    ls += p;
+                }
+                ls = sycl::reduce_over_group(sg, ls, sycl::plus<float>());
+                if (lane == 0) { sst[G + h] = sst[G + h] * alpha + ls; sst[h] = mn; sst[2 * G + h] = alpha; }
+            }
+            sycl::group_barrier(g);
+            // P.V: thread t owns dimension t
+#pragma unroll
+            for (int h = 0; h < G; ++h) acc[h] *= sst[2 * G + h];
+            for (int cc = 0; cc < CH; cc += 4) {
+                float vv[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const int s = srow[cc + j];
+                    vv[j] = s >= 0 ? load1<KVM>(vb + (size_t)s * a.vs0 + t) : 0.0f;
+                }
+#pragma unroll
+                for (int h = 0; h < G; ++h) {
+                    const sycl::float4 p4 = *reinterpret_cast<const sycl::float4*>(&sp[h][cc]);
+                    acc[h] = sycl::fma(p4[0], vv[0], acc[h]);
+                    acc[h] = sycl::fma(p4[1], vv[1], acc[h]);
+                    acc[h] = sycl::fma(p4[2], vv[2], acc[h]);
+                    acc[h] = sycl::fma(p4[3], vv[3], acc[h]);
+                }
+            }
+            sycl::group_barrier(g);
+        }
+        float smv[G], slv[G];
+#pragma unroll
+        for (int h = 0; h < G; ++h) { smv[h] = sst[h]; slv[h] = sst[G + h]; }
+        finish(a, it, acc, smv, slv);
+    }
+};
+
+// ---------------------------------------------------------------------------------------------------------------
+// Kernel 2: lane-per-cell Q.K with broadcast q. Chunk = THREADS cells; sub-group w scores cells [w*SG, (w+1)*SG).
+template <int KVM, int SG, bool BIG>
+struct BcastKernel {
+    static constexpr int CH = THREADS;
+    static constexpr int NW = THREADS / SG;
+    static constexpr int CPL = CH / SG;
+    using T = typename KVType<KVM>::T;
+    Args a;
+    sycl::local_accessor<float, 2> sq;     // [G][HD]
+    sycl::local_accessor<float, 2> sp;     // [G][CH]
+    sycl::local_accessor<int32_t, 1> srow; // [CH]
+    sycl::local_accessor<float, 1> sst;    // [3G]
+
+    auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+        namespace sx = sycl::ext::oneapi::experimental;
+        if constexpr (BIG) return sx::properties{sycl::ext::intel::experimental::grf_size<256>, sx::sub_group_size<SG>};
+        else return sx::properties{sx::sub_group_size<SG>};
+    }
+
+    void operator()(sycl::nd_item<3> it) const {   // sub-group size SG via get(properties_tag)
+        const int lr = it.get_group(0), kvh = it.get_group(1), split = it.get_group(2);
+        const int row = a.row0 + lr;
+        const int t = it.get_local_id(2);
+        auto g = it.get_group();
+        auto sg = it.get_sub_group();
+        const int lane = sg.get_local_id()[0], warp = sg.get_group_id()[0];
+        const uint16_t* qr = a.q + (size_t)row * a.qs0 + (size_t)(kvh * G) * a.qs1;
+        for (int i = t; i < G * HD; i += THREADS)
+            sq[i / HD][i % HD] = sycl::bit_cast<float>((uint32_t)qr[(size_t)(i / HD) * a.qs1 + (i % HD)] << 16) * a.qscale;
+        if (t < G) { sst[t] = NEG; sst[G + t] = 0.0f; sst[2 * G + t] = 1.0f; }
+        float acc[G];
+#pragma unroll
+        for (int h = 0; h < G; ++h) acc[h] = 0.0f;
+        const T* kb = static_cast<const T*>(a.k) + (size_t)kvh * a.ks1;
+        const T* vb = static_cast<const T*>(a.v) + (size_t)kvh * a.vs1;
+        const int32_t* sr = a.slots + (size_t)row * a.ss0;
+        const int cb = split * a.cpw, ce = sycl::min(cb + a.cpw, a.n_chunks);
+        for (int c = cb; c < ce; ++c) {
+            const int c0 = c * CH;
+            const int my = (c0 + t < a.T) ? sr[c0 + t] : -1;
+            srow[t] = my;
+            // 1 + the last valid cell of the chunk (0: nothing selected); P.V stops there
+            const int nv = sycl::reduce_over_group(g, my >= 0 ? t + 1 : 0, sycl::maximum<int>());
+            sycl::group_barrier(g);
+            if (nv == 0) continue;
+            // scores: lane = cell
+            {
+                const bool ok = my >= 0;                 // t == warp * SG + lane: this lane's own cell
+                if (sycl::any_of_group(sg, ok)) {
+                    const T* kp = kb + (size_t)(ok ? my : 0) * a.ks0;
+                    float s[G];
+#pragma unroll
+                    for (int h = 0; h < G; ++h) s[h] = 0.0f;
+                    for (int db = 0; db < HD; db += SG) {
+                        float qv[G];
+#pragma unroll
+                        for (int h = 0; h < G; ++h) qv[h] = sq[h][db + lane];
+                        float kf[SG];
+                        loadN<KVM, SG>(kp + db, kf);
+#pragma unroll
+                        for (int j = 0; j < SG; ++j) {
+#pragma unroll
+                            for (int h = 0; h < G; ++h) s[h] = sycl::fma(kf[j], sycl::group_broadcast(sg, qv[h], j), s[h]);
+                        }
+                    }
+#pragma unroll
+                    for (int h = 0; h < G; ++h) sp[h][t] = ok ? s[h] : NEG;
+                } else {
+#pragma unroll
+                    for (int h = 0; h < G; ++h) sp[h][t] = NEG;
+                }
+            }
+            sycl::group_barrier(g);
+            for (int h = warp; h < G; h += NW) {
+                float sv[CPL];
+                float mx = NEG;
+#pragma unroll
+                for (int j = 0; j < CPL; ++j) { sv[j] = sp[h][lane + j * SG]; mx = sycl::fmax(mx, sv[j]); }
+                mx = sycl::reduce_over_group(sg, mx, sycl::maximum<float>());
+                const float mo = sst[h];
+                const float mn = sycl::fmax(mo, mx);
+                const float alpha = mo == NEG ? 0.0f : sycl::native::exp2(mo - mn);
+                float ls = 0.0f;
+#pragma unroll
+                for (int j = 0; j < CPL; ++j) {
+                    const float p = sv[j] == NEG ? 0.0f : sycl::native::exp2(sv[j] - mn);
+                    sp[h][lane + j * SG] = p;
+                    ls += p;
+                }
+                ls = sycl::reduce_over_group(sg, ls, sycl::plus<float>());
+                if (lane == 0) { sst[G + h] = sst[G + h] * alpha + ls; sst[h] = mn; sst[2 * G + h] = alpha; }
+            }
+            sycl::group_barrier(g);
+#pragma unroll
+            for (int h = 0; h < G; ++h) acc[h] *= sst[2 * G + h];
+            for (int cc = 0; cc < nv; cc += 4) {
+                float vv[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const int s = srow[cc + j];
+                    vv[j] = s >= 0 ? load1<KVM>(vb + (size_t)s * a.vs0 + t) : 0.0f;
+                }
+#pragma unroll
+                for (int h = 0; h < G; ++h) {
+                    const sycl::float4 p4 = *reinterpret_cast<const sycl::float4*>(&sp[h][cc]);
+                    acc[h] = sycl::fma(p4[0], vv[0], acc[h]);
+                    acc[h] = sycl::fma(p4[1], vv[1], acc[h]);
+                    acc[h] = sycl::fma(p4[2], vv[2], acc[h]);
+                    acc[h] = sycl::fma(p4[3], vv[3], acc[h]);
+                }
+            }
+            sycl::group_barrier(g);
+        }
+        float smv[G], slv[G];
+#pragma unroll
+        for (int h = 0; h < G; ++h) { smv[h] = sst[h]; slv[h] = sst[G + h]; }
+        finish(a, it, acc, smv, slv);
+    }
+};
+
+// Strata attn_merge_kernel: log-sum-exp merge of the splits of one (row, q head); thread = dimension.
+struct MergeKernel {
+    const float* pacc; const float* pm; const float* pl;
+    uint16_t* out; int row0, n_split, Hk; float vunscale;
+    void operator()(sycl::nd_item<2> it) const {
+        const int gi = it.get_group(0);
+        const int Hq = Hk * G;
+        const int lr = gi / Hq, hq = gi % Hq, kvh = hq / G, hl = hq % G;
+        const int d = it.get_local_id(1);
+        const size_t base = ((size_t)lr * Hk + kvh) * n_split;
+        float M = NEG;
+        for (int s = 0; s < n_split; ++s) M = sycl::fmax(M, pm[(base + s) * G + hl]);
+        float L = 0.0f, acc = 0.0f;
+        for (int s = 0; s < n_split; ++s) {
+            const float m = pm[(base + s) * G + hl];
+            if (m == NEG) continue;
+            const float w = sycl::native::exp2(m - M);
+            L = sycl::fma(pl[(base + s) * G + hl], w, L);
+            acc = sycl::fma(pacc[((base + s) * G + hl) * HD + d], w, acc);
+        }
+        out[((size_t)(row0 + lr) * Hq + hq) * HD + d] = f2bf16_bits(L > 0.0f ? acc * vunscale / L : 0.0f);
+    }
+};
+
+template <template <int, int, bool> class K, int KVM, int SG, bool BIG>
+static void submit(sycl::queue& q, const Args& a, int rows, int Hk) {
+    constexpr int CH = K<KVM, SG, BIG>::CH;
+    q.submit([&](sycl::handler& h) {
+        K<KVM, SG, BIG> k{a, sycl::local_accessor<float, 2>(sycl::range<2>(G, HD), h),
+                          sycl::local_accessor<float, 2>(sycl::range<2>(G, CH), h),
+                          sycl::local_accessor<int32_t, 1>(sycl::range<1>(CH), h),
+                          sycl::local_accessor<float, 1>(sycl::range<1>(3 * G), h)};
+        sycl::nd_range<3> nr(sycl::range<3>((size_t)rows, (size_t)Hk, (size_t)a.n_split * THREADS),
+                             sycl::range<3>(1, 1, THREADS));
+        h.parallel_for(nr, k);   // grf size via the functor's get(properties_tag)
+    });
+}
+
+template <int KVM, int SG, bool BIG>
+static void dispatch_kernel(int kernel, sycl::queue& q, const Args& a, int rows, int Hk) {
+    if (kernel == 1) submit<StrataKernel, KVM, SG, BIG>(q, a, rows, Hk);
+    else submit<BcastKernel, KVM, SG, BIG>(q, a, rows, Hk);
+}
+
+template <int KVM>
+static void dispatch_sg(int kernel, int sg, bool big, sycl::queue& q, const Args& a, int rows, int Hk) {
+    if (sg == 16) { if (big) dispatch_kernel<KVM, 16, true>(kernel, q, a, rows, Hk); else dispatch_kernel<KVM, 16, false>(kernel, q, a, rows, Hk); }
+    else { if (big) dispatch_kernel<KVM, 32, true>(kernel, q, a, rows, Hk); else dispatch_kernel<KVM, 32, false>(kernel, q, a, rows, Hk); }
+}
+
+#ifndef N108_NO_TORCH
+static sycl::queue& queue_of(const at::Tensor& t) { return c10::xpu::getCurrentXPUStream(t.device().index()).queue(); }
+
+// q [R, Hq, 256] bf16; k, v [N, Hk, 256] (fp8 e4m3fn | bf16 | fp16); slots [R, T] int32 physical slots (-1 = masked).
+// kernel 1 = strata, 2 = bcast; cpw <= 0: all chunks in one work-group (no split / merge); sg 16 | 32;
+// grf 128 | 256; fp8_mode 0 exact | 1 via fp16; scratch_mb bounds the split partials (rows are processed in batches).
+at::Tensor row_attn(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor slots, double scale, int64_t kernel,
+                    int64_t cpw, int64_t sg, int64_t grf, int64_t fp8_mode, int64_t scratch_mb) {
+    TORCH_CHECK(q.is_xpu() && k.is_xpu() && v.is_xpu() && slots.is_xpu(), "n108qsa.row_attn: XPU tensors");
+    TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3 && slots.dim() == 2, "n108qsa.row_attn: ranks");
+    TORCH_CHECK(q.scalar_type() == at::kBFloat16, "n108qsa.row_attn: q must be bf16");
+    TORCH_CHECK(slots.scalar_type() == at::kInt, "n108qsa.row_attn: slots must be int32");
+    const int64_t R = q.size(0), Hq = q.size(1), Hk = k.size(1);
+    TORCH_CHECK(q.size(2) == HD && k.size(2) == HD && v.size(2) == HD && v.size(1) == Hk && v.size(0) == k.size(0),
+                "n108qsa.row_attn: head_dim 256, k/v shapes");
+    TORCH_CHECK(Hq == G * Hk, "n108qsa.row_attn: Hq must be 12 * Hk");
+    TORCH_CHECK(slots.size(0) == R, "n108qsa.row_attn: slots rows");
+    TORCH_CHECK(q.stride(2) == 1 && k.stride(2) == 1 && v.stride(2) == 1 && slots.stride(1) == 1, "n108qsa.row_attn: inner strides");
+    TORCH_CHECK(k.scalar_type() == v.scalar_type(), "n108qsa.row_attn: k/v dtype");
+    TORCH_CHECK(kernel == 1 || kernel == 2, "n108qsa.row_attn: kernel 1|2");
+    TORCH_CHECK(sg == 16 || sg == 32, "n108qsa.row_attn: sg 16|32");
+    int kvm;
+    const auto kd = k.scalar_type();
+    if (kd == at::kBFloat16) kvm = KV_BF16;
+    else if (kd == at::kHalf) kvm = KV_FP16;
+    else if (kd == at::kFloat8_e4m3fn) kvm = fp8_mode == 1 ? KV_FP8H : KV_FP8;
+    else TORCH_CHECK(false, "n108qsa.row_attn: k/v dtype must be fp8_e4m3fn, bf16 or fp16");
+    const int64_t esz = k.element_size();
+    const int64_t al = 16 / esz;   // 16-byte aligned rows
+    TORCH_CHECK(k.stride(0) % al == 0 && k.stride(1) % al == 0 && v.stride(0) % al == 0 && v.stride(1) % al == 0 &&
+                reinterpret_cast<uintptr_t>(k.data_ptr()) % 16 == 0 && reinterpret_cast<uintptr_t>(v.data_ptr()) % 16 == 0,
+                "n108qsa.row_attn: K/V rows must be 16-byte aligned");
+    auto out = at::empty({R, Hq, HD}, q.options());
+    const int T = (int)slots.size(1);
+    if (R == 0) return out;
+    if (T == 0) { out.zero_(); return out; }
+    const int CH = kernel == 1 ? StrataKernel<KV_BF16, 16, false>::CH : BcastKernel<KV_BF16, 16, false>::CH;
+    const int n_chunks = (T + CH - 1) / CH;
+    const int c = (cpw <= 0 || cpw > n_chunks) ? n_chunks : (int)cpw;
+    const int n_split = (n_chunks + c - 1) / c;
+    Args a{};
+    a.q = reinterpret_cast<const uint16_t*>(q.data_ptr()); a.qs0 = q.stride(0); a.qs1 = q.stride(1);
+    a.k = k.data_ptr(); a.ks0 = k.stride(0); a.ks1 = k.stride(1);
+    a.v = v.data_ptr(); a.vs0 = v.stride(0); a.vs1 = v.stride(1);
+    a.slots = slots.data_ptr<int32_t>(); a.ss0 = slots.stride(0); a.T = T;
+    const float vun = kvm == KV_FP8H ? 256.0f : 1.0f;
+    a.qscale = (float)scale * LOG2E * vun;
+    a.vunscale = vun;
+    a.cpw = c; a.n_split = n_split; a.n_chunks = n_chunks;
+    a.out = reinterpret_cast<uint16_t*>(out.data_ptr());
+    auto& qu = queue_of(q);
+    const bool big = grf == 256;
+    auto launch = [&](int rows) {
+        switch (kvm) {
+            case KV_BF16: dispatch_sg<KV_BF16>((int)kernel, (int)sg, big, qu, a, rows, (int)Hk); break;
+            case KV_FP16: dispatch_sg<KV_FP16>((int)kernel, (int)sg, big, qu, a, rows, (int)Hk); break;
+            case KV_FP8: dispatch_sg<KV_FP8>((int)kernel, (int)sg, big, qu, a, rows, (int)Hk); break;
+            default: dispatch_sg<KV_FP8H>((int)kernel, (int)sg, big, qu, a, rows, (int)Hk); break;
+        }
+    };
+    if (n_split == 1) {
+        a.row0 = 0;
+        launch((int)R);
+        return out;
+    }
+    const int64_t per_row = Hk * (int64_t)n_split * G * (HD + 2) * 4;
+    const int64_t budget = (scratch_mb > 0 ? scratch_mb : 256) << 20;
+    const int64_t RB = std::max<int64_t>(1, std::min<int64_t>(R, budget / per_row));
+    auto scratch = at::empty({RB * Hk * n_split * G * (HD + 2)}, q.options().dtype(at::kFloat));
+    float* sbase = scratch.data_ptr<float>();
+    a.pacc = sbase;
+    a.pm = sbase + RB * Hk * n_split * G * HD;
+    a.pl = a.pm + RB * Hk * n_split * G;
+    for (int64_t r0 = 0; r0 < R; r0 += RB) {
+        const int rows = (int)std::min<int64_t>(RB, R - r0);
+        a.row0 = (int)r0;
+        launch(rows);
+        MergeKernel mk{a.pacc, a.pm, a.pl, a.out, (int)r0, n_split, (int)Hk, a.vunscale};
+        qu.submit([&](sycl::handler& h) {
+            h.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t)rows * Hq, HD), sycl::range<2>(1, HD)), mk);
+        });
+    }
+    return out;
+}
+
+// decode the 256 e4m3fn codes with both device routes: out [2, 256] fp32 (route 1 already multiplied back by 256)
+at::Tensor fp8_decode_test(at::Tensor codes) {
+    TORCH_CHECK(codes.is_xpu() && codes.scalar_type() == at::kByte && codes.is_contiguous(), "fp8_decode_test: xpu uint8");
+    const int64_t n = codes.numel();
+    auto out = at::empty({2, n}, codes.options().dtype(at::kFloat));
+    const uint8_t* c = codes.data_ptr<uint8_t>();
+    float* o = out.data_ptr<float>();
+    queue_of(codes).parallel_for(sycl::range<1>((size_t)n), [=](sycl::id<1> i) {
+        o[i] = load1<KV_FP8>(c + i);
+        o[n + i] = load1<KV_FP8H>(c + i) * 256.0f;
+    });
+    return out;
+}
+
+#endif  // N108_NO_TORCH
+}  // namespace n108
+
+#ifndef N108_NO_TORCH
+TORCH_LIBRARY(n108qsa, m) {
+    m.def("row_attn(Tensor q, Tensor k, Tensor v, Tensor slots, float scale, int kernel, int cpw, int sg, int grf, "
+          "int fp8_mode, int scratch_mb) -> Tensor");
+    m.impl("row_attn", torch::kXPU, &n108::row_attn);
+    m.def("fp8_decode_test(Tensor codes) -> Tensor");
+    m.impl("fp8_decode_test", torch::kXPU, &n108::fp8_decode_test);
+}
+#endif

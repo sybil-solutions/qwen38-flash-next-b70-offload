@@ -1,0 +1,1192 @@
+{
+ "device": "xpu",
+ "interpret": false,
+ "torch": "2.13.0+xpu",
+ "hc": 4,
+ "hs": 2560,
+ "lr": 320,
+ "triton": "3.7.2",
+ "rows": [
+  {
+   "check": "norm grouped vs eager",
+   "M": 1,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": null,
+   "rule": "ulp1",
+   "pass": true
+  },
+  {
+   "check": "norm grouped fp32-w vs eager",
+   "M": 1,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": null,
+   "rule": "ulp1",
+   "pass": true
+  },
+  {
+   "check": "norm shared-w (per_branch=False)",
+   "M": 1,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": null,
+   "rule": "ulp1",
+   "pass": true
+  },
+  {
+   "check": "norm loop variant (BLOCK 512)",
+   "M": 1,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": null,
+   "rule": "ulp1",
+   "pass": true
+  },
+  {
+   "check": "mix eager vs compiled (floor)",
+   "M": 1,
+   "max_abs": 0.0078125,
+   "bit_equal": 0.518750011920929,
+   "pass": null
+  },
+  {
+   "check": "mix emulation vs compiled",
+   "M": 1,
+   "max_abs": 0.0,
+   "bit_equal": 1.0,
+   "pass": null
+  },
+  {
+   "check": "mix[epilogue] vs compiled",
+   "M": 1,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": 0.0078125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "mix[fused] vs compiled",
+   "M": 1,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": 0.0078125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "mix[fused_silu] vs compiled",
+   "M": 1,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": 0.0078125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "mix[fused] plain-ptr vs compiled",
+   "M": 1,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": 0.0078125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "combine eager vs compiled (floor)",
+   "M": 1,
+   "max_abs": 0.03125,
+   "bit_equal": 0.697558581829071,
+   "pass": null
+  },
+  {
+   "check": "combine emulation vs compiled",
+   "M": 1,
+   "max_abs": 0.03125,
+   "bit_equal": 0.784472644329071,
+   "pass": null
+  },
+  {
+   "check": "combine[torch] vs compiled",
+   "M": 1,
+   "max_abs": 0.03125,
+   "max_rel": 5.0,
+   "bit_equal": 0.784472644329071,
+   "max_ulp": 29984,
+   "floor": 0.03125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "combine[torch,round_g=0] vs compiled",
+   "M": 1,
+   "max_abs": 0.0,
+   "bit_equal": 1.0,
+   "pass": null
+  },
+  {
+   "check": "combine[fused] vs compiled",
+   "M": 1,
+   "max_abs": 0.03125,
+   "max_rel": 5.0,
+   "bit_equal": 0.784472644329071,
+   "max_ulp": 29984,
+   "floor": 0.03125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "combine[fused,round_g=0] vs compiled",
+   "M": 1,
+   "max_abs": 0.0,
+   "bit_equal": 1.0,
+   "pass": null
+  },
+  {
+   "check": "norm grouped vs eager",
+   "M": 2,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": null,
+   "rule": "ulp1",
+   "pass": true
+  },
+  {
+   "check": "norm grouped fp32-w vs eager",
+   "M": 2,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": null,
+   "rule": "ulp1",
+   "pass": true
+  },
+  {
+   "check": "norm shared-w (per_branch=False)",
+   "M": 2,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": null,
+   "rule": "ulp1",
+   "pass": true
+  },
+  {
+   "check": "norm loop variant (BLOCK 512)",
+   "M": 2,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": null,
+   "rule": "ulp1",
+   "pass": true
+  },
+  {
+   "check": "mix eager vs compiled (floor)",
+   "M": 2,
+   "max_abs": 0.03125,
+   "bit_equal": 0.52734375,
+   "pass": null
+  },
+  {
+   "check": "mix emulation vs compiled",
+   "M": 2,
+   "max_abs": 0.0,
+   "bit_equal": 1.0,
+   "pass": null
+  },
+  {
+   "check": "mix[epilogue] vs compiled",
+   "M": 2,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": 0.03125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "mix[fused] vs compiled",
+   "M": 2,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": 0.03125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "mix[fused_silu] vs compiled",
+   "M": 2,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": 0.03125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "mix[fused] plain-ptr vs compiled",
+   "M": 2,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": 0.03125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "combine eager vs compiled (floor)",
+   "M": 2,
+   "max_abs": 0.03125,
+   "bit_equal": 0.644091784954071,
+   "pass": null
+  },
+  {
+   "check": "combine emulation vs compiled",
+   "M": 2,
+   "max_abs": 0.03125,
+   "bit_equal": 0.710400402545929,
+   "pass": null
+  },
+  {
+   "check": "combine[torch] vs compiled",
+   "M": 2,
+   "max_abs": 0.03125,
+   "max_rel": 63.375633239746094,
+   "bit_equal": 0.710400402545929,
+   "max_ulp": 29820,
+   "floor": 0.03125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "combine[torch,round_g=0] vs compiled",
+   "M": 2,
+   "max_abs": 0.0,
+   "bit_equal": 1.0,
+   "pass": null
+  },
+  {
+   "check": "combine[fused] vs compiled",
+   "M": 2,
+   "max_abs": 0.03125,
+   "max_rel": 63.375633239746094,
+   "bit_equal": 0.710400402545929,
+   "max_ulp": 29820,
+   "floor": 0.03125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "combine[fused,round_g=0] vs compiled",
+   "M": 2,
+   "max_abs": 0.0,
+   "bit_equal": 1.0,
+   "pass": null
+  },
+  {
+   "check": "norm grouped vs eager",
+   "M": 4,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": null,
+   "rule": "ulp1",
+   "pass": true
+  },
+  {
+   "check": "norm grouped fp32-w vs eager",
+   "M": 4,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": null,
+   "rule": "ulp1",
+   "pass": true
+  },
+  {
+   "check": "norm shared-w (per_branch=False)",
+   "M": 4,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": null,
+   "rule": "ulp1",
+   "pass": true
+  },
+  {
+   "check": "norm loop variant (BLOCK 512)",
+   "M": 4,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": null,
+   "rule": "ulp1",
+   "pass": true
+  },
+  {
+   "check": "mix eager vs compiled (floor)",
+   "M": 4,
+   "max_abs": 0.03125,
+   "bit_equal": 0.522167980670929,
+   "pass": null
+  },
+  {
+   "check": "mix emulation vs compiled",
+   "M": 4,
+   "max_abs": 0.0,
+   "bit_equal": 1.0,
+   "pass": null
+  },
+  {
+   "check": "mix[epilogue] vs compiled",
+   "M": 4,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": 0.03125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "mix[fused] vs compiled",
+   "M": 4,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": 0.03125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "mix[fused_silu] vs compiled",
+   "M": 4,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": 0.03125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "mix[fused] plain-ptr vs compiled",
+   "M": 4,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": 0.03125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "combine eager vs compiled (floor)",
+   "M": 4,
+   "max_abs": 0.25,
+   "bit_equal": 0.666577160358429,
+   "pass": null
+  },
+  {
+   "check": "combine emulation vs compiled",
+   "M": 4,
+   "max_abs": 0.03125,
+   "bit_equal": 0.7685791254043579,
+   "pass": null
+  },
+  {
+   "check": "combine[torch] vs compiled",
+   "M": 4,
+   "max_abs": 0.03125,
+   "max_rel": 38.60451889038086,
+   "bit_equal": 0.7685791254043579,
+   "max_ulp": 30118,
+   "floor": 0.25,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "combine[torch,round_g=0] vs compiled",
+   "M": 4,
+   "max_abs": 0.0,
+   "bit_equal": 1.0,
+   "pass": null
+  },
+  {
+   "check": "combine[fused] vs compiled",
+   "M": 4,
+   "max_abs": 0.03125,
+   "max_rel": 38.60451889038086,
+   "bit_equal": 0.7685791254043579,
+   "max_ulp": 30118,
+   "floor": 0.25,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "combine[fused,round_g=0] vs compiled",
+   "M": 4,
+   "max_abs": 0.0,
+   "bit_equal": 1.0,
+   "pass": null
+  },
+  {
+   "check": "norm grouped vs eager",
+   "M": 8,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": null,
+   "rule": "ulp1",
+   "pass": true
+  },
+  {
+   "check": "norm grouped fp32-w vs eager",
+   "M": 8,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": null,
+   "rule": "ulp1",
+   "pass": true
+  },
+  {
+   "check": "norm shared-w (per_branch=False)",
+   "M": 8,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": null,
+   "rule": "ulp1",
+   "pass": true
+  },
+  {
+   "check": "norm loop variant (BLOCK 512)",
+   "M": 8,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": null,
+   "rule": "ulp1",
+   "pass": true
+  },
+  {
+   "check": "mix eager vs compiled (floor)",
+   "M": 8,
+   "max_abs": 0.03125,
+   "bit_equal": 0.5172363519668579,
+   "pass": null
+  },
+  {
+   "check": "mix emulation vs compiled",
+   "M": 8,
+   "max_abs": 1.52587890625e-05,
+   "bit_equal": 0.9999023675918579,
+   "pass": null
+  },
+  {
+   "check": "mix[epilogue] vs compiled",
+   "M": 8,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": 0.03125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "mix[fused] vs compiled",
+   "M": 8,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": 0.03125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "mix[fused_silu] vs compiled",
+   "M": 8,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": 0.03125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "mix[fused] plain-ptr vs compiled",
+   "M": 8,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": 0.03125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "combine eager vs compiled (floor)",
+   "M": 8,
+   "max_abs": 0.03125,
+   "bit_equal": 0.648913562297821,
+   "pass": null
+  },
+  {
+   "check": "combine emulation vs compiled",
+   "M": 8,
+   "max_abs": 0.03125,
+   "bit_equal": 0.7340454459190369,
+   "pass": null
+  },
+  {
+   "check": "combine[torch] vs compiled",
+   "M": 8,
+   "max_abs": 0.03125,
+   "max_rel": 81.44068145751953,
+   "bit_equal": 0.7340454459190369,
+   "max_ulp": 30092,
+   "floor": 0.03125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "combine[torch,round_g=0] vs compiled",
+   "M": 8,
+   "max_abs": 0.0,
+   "bit_equal": 1.0,
+   "pass": null
+  },
+  {
+   "check": "combine[fused] vs compiled",
+   "M": 8,
+   "max_abs": 0.03125,
+   "max_rel": 81.44068145751953,
+   "bit_equal": 0.7340454459190369,
+   "max_ulp": 30092,
+   "floor": 0.03125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "combine[fused,round_g=0] vs compiled",
+   "M": 8,
+   "max_abs": 0.0,
+   "bit_equal": 1.0,
+   "pass": null
+  },
+  {
+   "check": "norm grouped vs eager",
+   "M": 256,
+   "max_abs": 0.00390625,
+   "max_rel": 0.007462686393409967,
+   "bit_equal": 0.9999923706054688,
+   "max_ulp": 1,
+   "floor": null,
+   "rule": "ulp1",
+   "pass": true
+  },
+  {
+   "check": "norm grouped fp32-w vs eager",
+   "M": 256,
+   "max_abs": 0.00390625,
+   "max_rel": 0.007462686393409967,
+   "bit_equal": 0.9999923706054688,
+   "max_ulp": 1,
+   "floor": null,
+   "rule": "ulp1",
+   "pass": true
+  },
+  {
+   "check": "mix eager vs compiled (floor)",
+   "M": 256,
+   "max_abs": 0.03125,
+   "bit_equal": 0.5198273062705994,
+   "pass": null
+  },
+  {
+   "check": "mix emulation vs compiled",
+   "M": 256,
+   "max_abs": 0.001953125,
+   "bit_equal": 0.9999298453330994,
+   "pass": null
+  },
+  {
+   "check": "mix[epilogue] vs compiled",
+   "M": 256,
+   "max_abs": 0.001953125,
+   "max_rel": 0.1981566846370697,
+   "bit_equal": 0.9996871948242188,
+   "max_ulp": 41,
+   "floor": 0.03125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "mix[fused] vs compiled",
+   "M": 256,
+   "max_abs": 0.001953125,
+   "max_rel": 0.0069444444961845875,
+   "bit_equal": 0.999987781047821,
+   "max_ulp": 1,
+   "floor": 0.03125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "mix[fused_silu] vs compiled",
+   "M": 256,
+   "max_abs": 0.0009765625,
+   "max_rel": 0.27551019191741943,
+   "bit_equal": 0.9999557733535767,
+   "max_ulp": 54,
+   "floor": 0.03125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "combine eager vs compiled (floor)",
+   "M": 256,
+   "max_abs": 0.5,
+   "bit_equal": 0.6551048159599304,
+   "pass": null
+  },
+  {
+   "check": "combine emulation vs compiled",
+   "M": 256,
+   "max_abs": 0.25,
+   "bit_equal": 0.7296611666679382,
+   "pass": null
+  },
+  {
+   "check": "combine[torch] vs compiled",
+   "M": 256,
+   "max_abs": 0.25,
+   "max_rel": 1087.447509765625,
+   "bit_equal": 0.7296611666679382,
+   "max_ulp": 30245,
+   "floor": 0.5,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "combine[torch,round_g=0] vs compiled",
+   "M": 256,
+   "max_abs": 0.0,
+   "bit_equal": 1.0,
+   "pass": null
+  },
+  {
+   "check": "combine[fused] vs compiled",
+   "M": 256,
+   "max_abs": 0.25,
+   "max_rel": 1087.447509765625,
+   "bit_equal": 0.7296611666679382,
+   "max_ulp": 30245,
+   "floor": 0.5,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "combine[fused,round_g=0] vs compiled",
+   "M": 256,
+   "max_abs": 0.0,
+   "bit_equal": 1.0,
+   "pass": null
+  },
+  {
+   "check": "norm grouped vs eager",
+   "M": 8192,
+   "max_abs": 0.0625,
+   "max_rel": 0.0078125,
+   "bit_equal": 0.9999935030937195,
+   "max_ulp": 1,
+   "floor": null,
+   "rule": "ulp1",
+   "pass": true
+  },
+  {
+   "check": "norm grouped fp32-w vs eager",
+   "M": 8192,
+   "max_abs": 0.0625,
+   "max_rel": 0.0078125,
+   "bit_equal": 0.9999935030937195,
+   "max_ulp": 1,
+   "floor": null,
+   "rule": "ulp1",
+   "pass": true
+  },
+  {
+   "check": "mix eager vs compiled (floor)",
+   "M": 8192,
+   "max_abs": 0.0625,
+   "bit_equal": 0.5205253958702087,
+   "pass": null
+  },
+  {
+   "check": "mix emulation vs compiled",
+   "M": 8192,
+   "max_abs": 0.001953125,
+   "bit_equal": 0.9999470114707947,
+   "pass": null
+  },
+  {
+   "check": "mix[epilogue] vs compiled",
+   "M": 8192,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": 0.0625,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "mix[fused] vs compiled",
+   "M": 8192,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": 0.0625,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "mix[fused_silu] vs compiled",
+   "M": 8192,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": 0.0625,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "combine eager vs compiled (floor)",
+   "M": 8192,
+   "max_abs": 0.5,
+   "bit_equal": 0.6554740071296692,
+   "pass": null
+  },
+  {
+   "check": "combine emulation vs compiled",
+   "M": 8192,
+   "max_abs": 0.5,
+   "bit_equal": 0.7303168177604675,
+   "pass": null
+  },
+  {
+   "check": "combine[torch] vs compiled",
+   "M": 8192,
+   "max_abs": 0.5,
+   "max_rel": 2685.986572265625,
+   "bit_equal": 0.7303168177604675,
+   "max_ulp": 30425,
+   "floor": 0.5,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "combine[torch,round_g=0] vs compiled",
+   "M": 8192,
+   "max_abs": 0.0,
+   "bit_equal": 1.0,
+   "pass": null
+  },
+  {
+   "check": "combine[fused] vs compiled",
+   "M": 8192,
+   "max_abs": 0.5,
+   "max_rel": 2685.986572265625,
+   "bit_equal": 0.7303168177604675,
+   "max_ulp": 30425,
+   "floor": 0.5,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "combine[fused,round_g=0] vs compiled",
+   "M": 8192,
+   "max_abs": 0.015625,
+   "bit_equal": 0.9999748468399048,
+   "pass": null
+  },
+  {
+   "check": "graph replay vs eager (norm+mix+combine)",
+   "M": 1,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": null,
+   "rule": "exact",
+   "pass": true
+  },
+  {
+   "check": "graph replay vs eager (norm+mix+combine)",
+   "M": 4,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": null,
+   "rule": "exact",
+   "pass": true
+  },
+  {
+   "check": "patched norm vs original path",
+   "M": 1,
+   "max_abs": 0.001953125,
+   "max_rel": 0.0042553190141916275,
+   "bit_equal": 0.9999023675918579,
+   "max_ulp": 1,
+   "floor": null,
+   "rule": "ulp1",
+   "pass": true
+  },
+  {
+   "check": "patched mix vs original path",
+   "M": 1,
+   "max_abs": 0.001953125,
+   "max_rel": 0.0833333358168602,
+   "bit_equal": 0.983593761920929,
+   "max_ulp": 14,
+   "floor": 0.00421142578125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "patched combine vs original path",
+   "M": 1,
+   "max_abs": 0.015625,
+   "max_rel": 0.8352941274642944,
+   "bit_equal": 0.7510742545127869,
+   "max_ulp": 152,
+   "floor": 0.01287841796875,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "patched norm vs original path",
+   "M": 2,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": null,
+   "rule": "ulp1",
+   "pass": true
+  },
+  {
+   "check": "patched mix vs original path",
+   "M": 2,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": 0.00445556640625,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "patched combine vs original path",
+   "M": 2,
+   "max_abs": 0.03125,
+   "max_rel": 9.109588623046875,
+   "bit_equal": 0.6971679925918579,
+   "max_ulp": 29606,
+   "floor": 0.0262451171875,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "patched norm vs original path",
+   "M": 4,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": null,
+   "rule": "ulp1",
+   "pass": true
+  },
+  {
+   "check": "patched mix vs original path",
+   "M": 4,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": 0.0040283203125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "patched combine vs original path",
+   "M": 4,
+   "max_abs": 0.03125,
+   "max_rel": 56.10769271850586,
+   "bit_equal": 0.681933581829071,
+   "max_ulp": 30167,
+   "floor": 0.0294189453125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "patched norm vs original path",
+   "M": 8,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": null,
+   "rule": "ulp1",
+   "pass": true
+  },
+  {
+   "check": "patched mix vs original path",
+   "M": 8,
+   "max_abs": 0.0,
+   "max_rel": 0.0,
+   "bit_equal": 1.0,
+   "max_ulp": 0,
+   "floor": 0.00469970703125,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "patched combine vs original path",
+   "M": 8,
+   "max_abs": 0.03125,
+   "max_rel": 113.52747344970703,
+   "bit_equal": 0.735888659954071,
+   "max_ulp": 30134,
+   "floor": 0.0311279296875,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "patched norm vs original path",
+   "M": 256,
+   "max_abs": 0.0078125,
+   "max_rel": 0.007633587811142206,
+   "bit_equal": 0.9999969601631165,
+   "max_ulp": 1,
+   "floor": null,
+   "rule": "ulp1",
+   "pass": true
+  },
+  {
+   "check": "patched mix vs original path",
+   "M": 256,
+   "max_abs": 0.00390625,
+   "max_rel": 1.7180850505828857,
+   "bit_equal": 0.9988495111465454,
+   "max_ulp": 28995,
+   "floor": 0.005279541015625,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "patched combine vs original path",
+   "M": 256,
+   "max_abs": 0.0625,
+   "max_rel": 228.55555725097656,
+   "bit_equal": 0.7308788299560547,
+   "max_ulp": 30271,
+   "floor": 0.033447265625,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "patched norm vs original path",
+   "M": 8192,
+   "max_abs": 0.015625,
+   "max_rel": 0.0078125,
+   "bit_equal": 0.9999954104423523,
+   "max_ulp": 1,
+   "floor": null,
+   "rule": "ulp1",
+   "pass": true
+  },
+  {
+   "check": "patched mix vs original path",
+   "M": 8192,
+   "max_abs": 0.0078125,
+   "max_rel": 17.785276412963867,
+   "bit_equal": 0.9989033937454224,
+   "max_ulp": 29197,
+   "floor": 0.006744384765625,
+   "rule": "floor",
+   "pass": true
+  },
+  {
+   "check": "patched combine vs original path",
+   "M": 8192,
+   "max_abs": 0.0625,
+   "max_rel": 2177.0,
+   "bit_equal": 0.7312204241752625,
+   "max_ulp": 30480,
+   "floor": 0.037353515625,
+   "rule": "floor",
+   "pass": true
+  }
+ ],
+ "timing": [
+  {
+   "M": 1,
+   "norm_eager": 0.21029424999999996,
+   "norm_tri": 0.09741665,
+   "mix_compiled": 0.2493047,
+   "mix_eager": 0.26064845000000003,
+   "mix_epilogue": 0.31409115,
+   "mix_fused": 0.24556774999999997,
+   "mix_fused_silu": 0.17465625,
+   "gemm_down": 0.061731749999999995,
+   "gemm_up": 0.053242199999999996,
+   "combine_compiled": 0.1621406,
+   "combine_eager": 0.15074479999999998,
+   "combine_torch": 0.1643854,
+   "combine_fused": 0.0988203,
+   "gemm_inject": 0.0545755
+  },
+  {
+   "M": 2,
+   "norm_eager": 0.17660415,
+   "norm_tri": 0.08496355,
+   "mix_compiled": 0.21829169999999998,
+   "mix_eager": 0.22278645,
+   "mix_epilogue": 0.27052605,
+   "mix_fused": 0.21184374999999997,
+   "mix_fused_silu": 0.1577422,
+   "gemm_down": 0.0469427,
+   "gemm_up": 0.0460026,
+   "combine_compiled": 0.155987,
+   "combine_eager": 0.1285677,
+   "combine_torch": 0.14850785,
+   "combine_fused": 0.08610939999999999,
+   "gemm_inject": 0.0471302
+  },
+  {
+   "M": 4,
+   "norm_eager": 0.17733595,
+   "norm_tri": 0.0835078,
+   "mix_compiled": 0.21848695,
+   "mix_eager": 0.22359374999999998,
+   "mix_epilogue": 0.26570309999999997,
+   "mix_fused": 0.2086302,
+   "mix_fused_silu": 0.15059894999999998,
+   "gemm_down": 0.04658854999999999,
+   "gemm_up": 0.0454766,
+   "combine_compiled": 0.15172915,
+   "combine_eager": 0.13138805,
+   "combine_torch": 0.14804165,
+   "combine_fused": 0.08538285,
+   "gemm_inject": 0.0456458
+  },
+  {
+   "M": 8,
+   "norm_eager": 0.1862682,
+   "norm_tri": 0.08860414999999999,
+   "mix_compiled": 0.2310807,
+   "mix_eager": 0.23446094999999997,
+   "mix_epilogue": 0.27722135,
+   "mix_fused": 0.2191901,
+   "mix_fused_silu": 0.1566875,
+   "gemm_down": 0.04967705,
+   "gemm_up": 0.0492578,
+   "combine_compiled": 0.1571979,
+   "combine_eager": 0.13685414999999998,
+   "combine_torch": 0.15441929999999998,
+   "combine_fused": 0.08869269999999999,
+   "gemm_inject": 0.045848999999999994
+  },
+  {
+   "M": 256,
+   "norm_eager": 0.20191664999999998,
+   "norm_tri": 0.08496614999999999,
+   "mix_compiled": 0.23019529999999996,
+   "mix_eager": 0.23344009999999998,
+   "mix_epilogue": 0.27764584999999997,
+   "mix_fused": 0.29363284999999995,
+   "mix_fused_silu": 0.26697395,
+   "gemm_down": 0.052216149999999996,
+   "gemm_up": 0.04592705,
+   "combine_compiled": 0.1595521,
+   "combine_eager": 0.1404609,
+   "combine_torch": 0.15790105,
+   "combine_fused": 0.08572135,
+   "gemm_inject": 0.05196615
+  },
+  {
+   "M": 8192,
+   "norm_eager": 6.5735885,
+   "norm_tri": 0.7041328499999999,
+   "mix_compiled": 1.84985675,
+   "mix_eager": 3.1933542,
+   "mix_epilogue": 1.9018437499999998,
+   "mix_fused": 3.27220575,
+   "mix_fused_silu": 4.3669245,
+   "gemm_down": 0.5929219,
+   "gemm_up": 0.54341145,
+   "combine_compiled": 1.3353125,
+   "combine_eager": 2.09278385,
+   "combine_torch": 1.19757035,
+   "combine_fused": 1.18142445,
+   "gemm_inject": 0.3216745
+  }
+ ],
+ "notes": [
+  "[drift] installed /opt/venv/lib/python3.12/site-packages/sglang/srt/layers/hyperconnection.py matches the reference copy (10 anchor lines)",
+  "[projection M=8192] per forward (97 mix incl. norm + 96 combine): reference 945.3 ms -> n107-hc 366.2 ms (x2.58); best mix mode epilogue (1.902 ms), best combine fused (1.181 ms)",
+  "[decode M=1] one layer-half (norm+mix+combine): reference 621.7 us -> 370.9 us (eager-launch timing; graph replay removes most launch cost)",
+  "[decode M=2] one layer-half (norm+mix+combine): reference 550.9 us -> 328.8 us (eager-launch timing; graph replay removes most launch cost)",
+  "[decode M=4] one layer-half (norm+mix+combine): reference 547.6 us -> 319.5 us (eager-launch timing; graph replay removes most launch cost)",
+  "[decode M=8] one layer-half (norm+mix+combine): reference 574.5 us -> 334.0 us (eager-launch timing; graph replay removes most launch cost)"
+ ],
+ "gpu": "_XpuDeviceProperties(name='Intel(R) Arc(TM) Pro B70 Graphics', platform_name='Intel(R) oneAPI Unified Runtime over Level-Zero V2', type='gpu', device_id=0xE223, uuid=868023e2-0000-0000-8400-000000000000, driver_version='1.15.38308+1', total_memory=32656MB, local_mem_size=128KB, last_level_cache_size=24576KB, max_compute_units=256, memory_clock_rate=2800MHz, memory_bus_width=64-bit, gpu_eu_count=256, gpu_subslice_count=32, max_work_group_size=1024, max_num_sub_groups=64, sub_group_sizes=[16 32], has_fp16=1, has_fp64=1, has_atomic64=1, is_integrated_gpu=0)",
+ "fails": [],
+ "pass": true
+}
