@@ -24,7 +24,7 @@ Full tables, NVMe and memory numbers, and the quality method: [docs/results.md](
 store on a local NVMe filesystem that supports `O_DIRECT` (xfs or ext4).
 
 ```bash
-IMG=ghcr.io/sybil-solutions/qwen38-flash-next-b70-offload@sha256:__DIGEST__
+IMG=ghcr.io/sybil-solutions/qwen38-flash-next-b70-offload@sha256:d30df691d6ab890b95f7c6179e4b677a0d759018e39b20e93bf0efdb8780450c
 M=turboderp-Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5
 hf download turboderp/Qwen3.8-Flash-Next-exl3 --revision 69e33439ae950f17bcbe95c98f117d80f759ab6d --local-dir /data/$M
 docker run --rm -v /data/$M:/models/$M:ro -v /mnt/nvme/qwen-b70:/nvx "$IMG" pack-store    # once: 45.8 GB store
@@ -38,13 +38,19 @@ docker run -d --name qwen-b70 --device $R --memory 16g --memory-swap 16g --shm-s
   --cuda-graph-bs-decode 1 2 4 --reasoning-parser qwen3 --tool-call-parser qwen3_coder
 ```
 
+Image: [local-ai-images `qwen38-flash-next-b70-offload`](https://github.com/sybil-solutions/local-ai-images/tree/main/qwen38-flash-next-b70-offload),
+built and attested by CI from commit 2f108fb. Measured on this digest at 16 GiB: 8k C1 29.3 / C2 39.3 / C4 49.2 tok/s,
+32k C1 29.7 / C2 40.1, prefill 1,064-1,296 tok/s; at 32 GiB: 8k C1 25.2 / C4 33.9, 32k C1 26.3.
+
 The server is ready in about 2.5 minutes at `http://127.0.0.1:30000/v1`, model `flashnext`. For 32 GiB use
 `--memory 32g --memory-swap 32g -e QWEN_B70_MODE=nvme32`. Keep `--memory-swap` equal to `--memory`. Only the render
 node is passed in; no `--ipc host`, seccomp or ptrace changes. Send one or two warm-up requests after start: the VRAM
 expert cache starts empty and the first answer can be poor.
 
-**Omarchy Local AI.** The launch is in the [local-ai-registry](https://github.com/sybil-solutions/local-ai-registry)
-for `intel-arc-pro-b70-32gb`; the plugin builds the store and starts the server.
+**Omarchy Local AI.** Not in the [local-ai-registry](https://github.com/sybil-solutions/local-ai-registry) yet: on this
+image both modes pass the lab's load, reasoning, tools, context and speed gates (16 GiB: 25.4 tok/s, prefill 1,185) but
+fail the chat gate. The lab's first question ("Name three primary colors", thinking on, temperature 0.6) kept thinking
+until the 64k context ran out, on a freshly started server, in both modes.
 
 ## How it works
 
@@ -83,7 +89,9 @@ for `intel-arc-pro-b70-32gb`; the plugin builds the store and starts the server.
 - `plugin/`: SGLang exl3xpu plugin with tier mode, `exl3xpu/nvtier.py` (tiers, staged prefill, admission control)
 - `kernels/`, `experimental/`, `research/`: kernels, work in progress (victim ring, GDN prefill, MTP), analyses
 
-Known issues: the tier has a write-back race (an evicted expert can be flagged resident while its page is queued for
+Known issues: masked decode picks can send a thinking-mode answer into a loop, most often right after start when the
+VRAM cache is empty (see above; `EXL3_NVTIER_VRAM_WARM=7500` warms the cache from the prior in ~4 s and is
+experimental). The tier has a write-back race (an evicted expert can be flagged resident while its page is queued for
 release); the victim ring in `experimental/n111-victim-ring` removes it and is not in the server yet. The B70 test box
 has marginal PCIe links; no measurement here was taken during a fault window.
 

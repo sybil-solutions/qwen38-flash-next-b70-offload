@@ -15,8 +15,8 @@ case "${QWEN_B70_MODE:-nvme16}" in
   nvme32) : "${EXL3_NVTIER_RAM_GB:=7}" "${EXL3_NVTIER_STAGE_HOSTBUF:=5}" "${EXL3_NVTIER_ADMIT:=0}" "${EXL3_NVTIER_DECODE_FILL_QUEUES:=1}" ;;
   *) echo "QWEN_B70_MODE must be nvme16 or nvme32" >&2; exit 2 ;;
 esac
-# both modes: warm the VRAM expert cache with the 7,500 hottest prior experts at start (cold starts mask most picks)
-: "${EXL3_NVTIER_VRAM_WARM:=7500}"
+# experimental, off by default: EXL3_NVTIER_VRAM_WARM=7500 warms the VRAM expert cache from the prior at start
+: "${EXL3_NVTIER_VRAM_WARM:=0}"
 export EXL3_NVTIER_RAM_GB EXL3_NVTIER_STAGE_HOSTBUF EXL3_NVTIER_ADMIT EXL3_NVTIER_DECODE_FILL_QUEUES EXL3_NVTIER_VRAM_WARM
 if [ "${EXL3_NVTIER:-1}" = 1 ] && [ "$#" -gt 0 ]; then
   python3 /opt/qwen-b70/serve/pack_store.py probe
