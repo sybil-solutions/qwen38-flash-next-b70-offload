@@ -2,156 +2,91 @@
 
 ![Qwen3.8-Flash-Next on one Arc Pro B70 with experts on NVMe](docs/banner.svg)
 
-## At a glance
+Run **Qwen3.8-Flash-Next** (EXL3 3.05 bpw, 48 MoE layers x 512 experts, 45.8 GB of experts) on **one Intel Arc Pro
+B70 32 GB** with an OpenAI-compatible API, using a little RAM and an NVMe drive for the experts that do not fit on the
+card.
 
-| | |
-|---|---|
-| Model | Qwen3.8-Flash-Next, EXL3 3.05 bpw ([`turboderp/Qwen3.8-Flash-Next-exl3`](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3) @ `3.05bpw_h5_ng5`): 48 MoE layers × 512 routed experts, top-10, 45.8 GB of experts, ~32.6 GB n-gram (PLE) table |
-| Hardware | 1× Intel Arc Pro B70 32 GB (PCIe Gen4 x16), **host RAM capped at 32 GB**, 4× Samsung 9100 PRO 1 TB in RAID0 (26 GB/s), AMD EPYC 7443P (14 cores used) |
-| Decode | 24.0 / 28.7 / 26.4 tok/s at 1 / 2 / 4 streams (8k prompts), 23.9 / 25.4 at 1 / 2 streams (32k prompts) |
-| Prefill | 1,056–1,233 tok/s at 8k, 1,106–1,260 tok/s at 32k |
-| How | 8,000 hot experts cached in VRAM, a 7 GB RAM expert tier, everything else read from NVMe. Prefill streams each layer's experts NVMe → RAM → copy engine → VRAM, 4 layers ahead |
-| Experimental | Decode without the VRAM→RAM victim write-back: **34.5 / 54.8 / 76.3 tok/s** at 1 / 2 / 4 streams. More expert picks are masked; a quality gate is running (see [Experimental](#experimental-no-write-back-decode)) |
-| Status | Research build, measured end to end on 2026-10-06 |
+| RAM for the server | mode | decode, 1 user (8k) | decode, 4 users (8k) | prefill 8k / 32k | output vs stock exllamav3 |
+|---|---|---|---|---|---|
+| **16 GiB cap** + NVMe | **`nvme16`** | **29.2 tok/s** | 52.6 tok/s total | 1,139 / 1,184 tok/s | approximate: prefill panel top-1 0.985, KL 0.003; decode KL 0.055 |
+| 32 GiB cap + NVMe | `nvme32` (srv23) | 25.6 tok/s | 32.4 tok/s total | 1,135 / 1,193 tok/s | approximate: prefill panel top-1 0.984, KL 0.003; decode KL 0.021 |
 
-Serve **Qwen3.8-Flash-Next** with an OpenAI-compatible API from **one Intel Arc Pro B70** and **32 GB of host RAM**,
-with the routed experts on NVMe. SGLang + the [`exl3xpu`](https://github.com/0xSero/exl3xpu) plugin (EXL3 trellis
-kernels for Xe2) + an NVMe expert tier:
+Both rows were measured in the same session on 2026-10-08 (run N130), on 1x Arc Pro B70 (PCIe 4.0 x16), AMD EPYC 7443P
+(8 CPUs for the container), and 4x Samsung 9100 PRO in RAID0. Decode runs each answer to its natural end.
 
-- **Decode:** a device-managed VRAM expert cache (8,000 slots). Picks that miss VRAM read the RAM tier (memfd, 2 MiB
-  pages, read by the GPU through xe SVM); picks in neither are masked and filled from NVMe in the background.
-- **Prefill:** big batches stream every non-VRAM expert of a layer from the RAID0 (O_DIRECT, 32 threads) into an
-  anonymous THP buffer, then the copy engine moves it into a VRAM double buffer while the previous layer computes.
-- **Full-attention layers:** sparse attention with per-query top-2048 selection, using SYCL kernels ported from
-  [Strata](https://github.com/Niko1221/Strata) (MIT) and re-tuned for our fp8 KV.
+**Which one?** `nvme32` stays closest to stock output: its decode masks fewer experts. `nvme16` fits in half the RAM
+and is faster, because it masks more experts during decode (16 GB decode KL 0.055 vs 0.021). Neither is bit-exact.
+Full tables, NVMe and memory numbers, and the quality method: [docs/results.md](docs/results.md).
 
-## Measured
+## Run it
 
-srv23, the current default. Each stream gets its own prompt (8,181–8,189 or 32,928–32,932 tokens). Completions run to
-their natural end. Decode at 2 or 4 streams is the total across streams.
-
-| prefill length | concurrency | decode tok/s | prefill tok/s | time to first token |
-|---|---|---|---|---|
-| 8k | 1 | 24.0 | 1,056 | 7.8 s |
-| 8k | 2 | 28.7 | 1,092 | 14.9 s |
-| 8k | 4 | 26.4 | 1,233 | 13.6–26.6 s |
-| 32k | 1 | 23.9 | 1,106 | 29.8 s |
-| 32k | 2 | 25.4 | 1,260 | 34.9 / 52.3 s |
-
-### What each change bought
-
-Each cell is decode tok/s / prefill tok/s. Every row adds one change to the row above.
-
-| run | change | 8k C1 | 8k C2 | 8k C4 | 32k C1 | 32k C2 |
-|---|---|---|---|---|---|---|
-| srv20 | baseline: staged NVMe prefill | 20.9 / 693 | 25.1 / 786 | 24.1 / 868 | 21.9 / 716 | 22.0 / 734 |
-| srv21 | + async decode step (no per-token device sync) | 22.6 / 717 | 26.3 / 784 | 24.7 / 870 | 23.8 / 713 | 22.4 / 741 |
-| srv22 | + fused hyper-connection kernels (Triton, `kernels/n107-hc`) | 23.1 / 799 | 27.8 / 883 | 26.8 / 960 | 24.1 / 762 | 23.0 / 752 |
-| **srv23** | **+ SYCL sparse attention and selection (`kernels/n107-qsa`)** | **24.0 / 1,056** | **28.7 / 1,092** | **26.4 / 1,233** | **23.9 / 1,106** | **25.4 / 1,260** |
-| srv25 | srv23 with the radix cache off (control) | 23.8 / 1,026 | 27.7 / 1,095 | 26.8 / 1,220 | 24.4 / 1,127 | 24.5 / 1,272 |
-
-Raw results are under [`results/`](results/).
-
-- **Sparse attention:** at 8,192 query rows the SYCL kernel takes 55.9 ms per layer at 8k context and 65.5 ms at 32k.
-  The previous union path took 255 and 459 ms. The selection kernels pick the same blocks as the torch path on every
-  checked row, both in tests and inside the server.
-- **Hyper-connections:** the fused kernels cut the work per 8k forward from 945 ms to 366 ms.
-- **Rejected:** SGLang's fused GDN backend (`--linear-attn-backend intel_xpu`). At 4 streams, 3 of 4 outputs ran away to
-  ~57k tokens.
-
-### Experimental: no-write-back decode
-
-srv26 = srv23 + `NOVICT=1`. The decode kernel no longer writes VRAM-evicted experts back to the RAM tier. Each
-write-back costs ~0.9 ms on the critical path ([`results/N109-svm-vs-usm`](results/N109-svm-vs-usm/)).
-
-| prefill length | concurrency | decode tok/s | prefill tok/s | token latency p50 |
-|---|---|---|---|---|
-| 8k | 1 | 34.5 | 1,018 | 27 ms |
-| 8k | 2 | 54.8 | 1,013 | 34 ms |
-| 8k | 4 | 76.3 | 1,123 | 44 ms |
-| 32k | 1 | 34.1 | 1,120 | 28 ms |
-| 32k | 2 | 42.9 | 1,136 | 35 ms |
-
-Masked expert picks rise from 4–12 to ~32–38 per decode step, about 7% of picks at 1 stream. That is an
-approximation, so it stays off by default until the decode quality gate passes. The fix that keeps exact output (an
-async victim ring drained by the copy engine) is in progress.
-
-## Experimental (validated standalone, not yet in the server)
-
-| folder | what | status |
-|---|---|---|
-| [`experimental/n111-victim-ring`](experimental/n111-victim-ring/) | decode kernel parks VRAM victims in a VRAM ring (µs) instead of storing to host (~0.9 ms each). Host drains the ring through pinned staging, and only the host sets the RAM-resident flag (`_moe_a9`/`a9b` patches, `VRING=1`) | bit-exact 72/72 calls; stress simulation 0 mismatches; +0.2–0.5 ms/step vs +9–30 ms for today's write-back |
-| [`experimental/n112-gdn`](experimental/n112-gdn/) | SYCL token-serial GDN prefill recurrence ported from Strata (MIT), drop-in for SGLang's `chunk_gated_delta_rule` extend call (`EXL3_GDN_SYCL=1`) | CPU-validated against fp64: output rel 1.66e-3, final state 4e-9, chunk continuation bit-identical. GPU test pending |
-| [`experimental/n114-decode`](experimental/n114-decode/) | fused decode kernels from Strata: GDN step (6–7 → 2 kernels/layer), hyper-connection read (~7 → 3–4/half), decode QSA (~45 → 2/layer), graph-safe | builds; CPU tests pass. GPU test pending |
-| [`experimental/n113-mtp`](experimental/n113-mtp/) | MTP self-speculation (SGLang NEXTN) in tier mode: MTP experts pinned in VRAM, safe verify rows | plan + plugin override written; projected 32–43 tok/s exact at 1 stream. Not run yet |
-
-## Known issues
-
-- **Write-back race in the default tier path.** In a stress simulation (N111), the decode kernel's direct victim
-  write-back produced 50–52 mismatched output rows and 8–10 bad RAM pages. The GPU marks a written-back expert
-  resident while the host still has that page queued for punching. The victim ring removes the race because only the
-  host sets the flag. Until it lands, treat long greedy runs on the default path with care. Runaway generations were
-  observed once in the exact config.
-- **Hardware.** On the test box, PCIe links are marginal under load. Both B70s dropped off the bus once on 2026-10-06,
-  and the box needed a BMC power cycle. None of the measurements above were taken during a fault window.
-
-## Hardware used
-
-| part | detail |
-|---|---|
-| GPU | Intel Arc Pro B70 32 GB (Battlemage G31), Gen4 x16. VRAM holds 8,000 expert slots (14.9 GB), fp8 KV cache capped at 131,072 tokens (1.5 GB), mamba state 32 slots (3.8 GB) and 2 × 0.95 GB staging buffers |
-| Host RAM | Container capped at 32 GB (`--memory 32g`), peak use ~22 GiB; RAM expert tier 7 GB |
-| Expert store | 4× Samsung 9100 PRO 1 TB on an x4x4x4x4 quad M.2 card, md RAID0 (512 KB chunk) + XFS. fio: 26 GB/s at 1.82 MB records, 1.12M 4K IOPS |
-| CPU | AMD EPYC 7443P, server pinned to cores 26–39 |
-
-## Run
-
-`serve/n104_serve.sh` launches the server through a GPU lock wrapper (`bench/xpu_run.sh`). It expects:
-- the SGLang + exl3xpu image (`24c872759256`);
-- the model directory;
-- the packed expert store (`qwen_experts.bin`: one 4K-aligned 1,863,680 B record per expert, index `layer*512+e`) at `/mnt/nvx/n104`.
-
-The srv23 configuration:
+**Docker.** Needs one Arc Pro B70 with the `xe` driver, `hf`, 80 GB for the checkpoint, and 45.8 GB for the expert
+store on a local NVMe filesystem that supports `O_DIRECT` (xfs or ext4).
 
 ```bash
-STAGE=1 NVASYNC=1 HCXPU=1 HOSTBUF=5 RAM_GB=7 MAXTOT=131072 CHUNK=8192 MAXRUN=4 MAMBA=32 SLOTS=8000 \
-GRAPH_BS=1,2,4 QSAIMPL=sycl_row QSASELECT=sycl \
-  bench/xpu_run.sh 0000:84:00.0 n104-srv serve/n104_serve.sh runs/srv23
+IMG=ghcr.io/sybil-solutions/qwen38-flash-next-b70-offload@sha256:__DIGEST__
+M=turboderp-Qwen3.8-Flash-Next-exl3-3.05bpw_h5_ng5
+hf download turboderp/Qwen3.8-Flash-Next-exl3 --revision 69e33439ae950f17bcbe95c98f117d80f759ab6d --local-dir /data/$M
+docker run --rm -v /data/$M:/models/$M:ro -v /mnt/nvme/qwen-b70:/nvx "$IMG" pack-store    # once: 45.8 GB store
+R=$(readlink -f /dev/dri/by-path/pci-0000:48:00.0-render)   # your B70's render node (lspci | grep B70)
+docker run -d --name qwen-b70 --device $R --memory 16g --memory-swap 16g --shm-size 8g --ulimit memlock=-1 \
+  -e QWEN_B70_MODE=nvme16 -p 127.0.0.1:30000:30000 -v /data/$M:/models/$M:ro -v /mnt/nvme/qwen-b70:/nvx:ro "$IMG" \
+  python3 -m sglang.launch_server --model-path /models/$M --quantization exl3 --trust-remote-code --device xpu \
+  --host 0.0.0.0 --port 30000 --served-model-name flashnext --disable-shared-experts-fusion --kv-cache-dtype fp8_e4m3 \
+  --context-length 65536 --mem-fraction-static 0.85 --chunked-prefill-size 8192 --max-total-tokens 131072 \
+  --max-running-requests 4 --dtype bfloat16 --max-mamba-cache-size 32 --cuda-graph-backend-decode full \
+  --cuda-graph-bs-decode 1 2 4 --reasoning-parser qwen3 --tool-call-parser qwen3_coder
 ```
 
-The OpenAI-compatible API listens on `127.0.0.1:30260` under the model name `flashnext`. Reproduce the tables with
-`serve/n104_matrix.sh <run> 8192x1,8192x2,8192x4,32768x1,32768x2 <VARS...>`. It runs `serve/bench_matrix.py`: distinct
-prompts per stream, completions to their natural end, and token timestamps for decode overlap and stalls.
+The server is ready in about 2.5 minutes at `http://127.0.0.1:30000/v1`, model `flashnext`. For 32 GiB use
+`--memory 32g --memory-swap 32g -e QWEN_B70_MODE=nvme32`. Keep `--memory-swap` equal to `--memory`. Only the render
+node is passed in; no `--ipc host`, seccomp or ptrace changes. Send one or two warm-up requests after start: the VRAM
+expert cache starts empty and the first answer can be poor.
 
-Knobs (`serve/n104_serve.sh`, all default off):
+**Omarchy Local AI.** The launch is in the [local-ai-registry](https://github.com/sybil-solutions/local-ai-registry)
+for `intel-arc-pro-b70-32gb`; the plugin builds the store and starts the server.
 
-| knob | effect |
-|---|---|
-| `STAGE=1` | staged prefill (NVMe → THP buffer → copy engine → VRAM) |
-| `HOSTBUF` | depth of the host buffer ring (read-ahead = HOSTBUF−1 layers) |
-| `NVASYNC=1` | async decode step |
-| `HCXPU=1` | Triton hyper-connection kernels |
-| `QSAIMPL=sycl_row` | SYCL sparse attention |
-| `QSASELECT=sycl` | SYCL selection |
-| `NOVICT=1` | no victim write-back (experimental) |
+## How it works
 
-## Layout
+```text
+  +----------------------------------------------------------------------+
+  | VRAM expert cache: 8,000 slots (14.9 GB), device-managed LRU         |
+  | a pick that hits RAM is copied in by the kernel (write-through)      |
+  +---------------^------------------------------------------------------+
+                  | GPU reads RAM pages through xe SVM
+  +---------------+------------------------------------------------------+
+  | RAM tier: one 2 MiB page per expert in a sparse memfd, 2 GB / 7 GB   |
+  | holds experts that are not in VRAM; evicted VRAM experts move here   |
+  +---------------^------------------------------------------------------+
+                  | O_DIRECT reads: 8 decode-fill queues, 32 prefill readers
+  +---------------+------------------------------------------------------+
+  | NVMe store: all 24,576 experts, one 4K-aligned 1.86 MB record each   |
+  +----------------------------------------------------------------------+
+```
 
-| path | what |
-|---|---|
-| `serve/` | serve script, matrix launcher, benchmark client, smoke test |
-| `plugin/` | SGLang exl3xpu plugin with tier mode (`sglang_plugin.tier.py`), `exl3xpu/nvtier.py` (NVMe/RAM/VRAM tier, staged prefill, async step), `exl3xpu/moe_offload.py` |
-| `kernels/n107-hc/` | Triton hyper-connection norm/mix/combine for XPU, tests, patch |
-| `kernels/n107-qsa/` | SYCL sparse attention and selection (ported from Strata), Triton variants, tests, serve integration |
-| `kernels/n107-decode/` | async decode step patch |
-| `results/` | `matrix.jsonl` per run, env, smoke outputs, and the SVM-vs-USM decode measurements |
-| `research/` | B70 ingest-ceiling analysis and the lessons taken from Strata |
+- **Decode.** A pick in neither VRAM nor RAM is masked for that step (weight 0) and read from NVMe in the background,
+  so decode never waits on the drive. That is why decode is approximate, and why more RAM means fewer masked picks.
+- **Admission control (16 GB).** With a small RAM tier, queued reads used to hold the whole budget and every finished
+  read was evicted before the GPU used it: the tier collapsed and ~470 of 480 picks were masked. Now only RAM copies of
+  experts already in VRAM, or entries older than 4 steps, are evicted; new reads are admitted only into free budget
+  (at most 256 in flight, most-missed first); 8 reader queues land them within a step or two.
+- **Prefill.** For batches of 256+ tokens, each layer's experts that are not in VRAM stream NVMe -> RAM buffer -> copy
+  engine -> VRAM while the previous layer computes. Prefill is GPU-bound (4.2 of 5.4 s per 8k forward is attention,
+  GDN and dense work); NVMe runs at 16-22 % of the array.
+- **Kernels.** SYCL sparse attention and block selection for the full-attention layers (ported from Strata, MIT),
+  Triton hyper-connection kernels, and exl3xpu MoE kernels with the tier patches (`kernels/moe-a8`).
 
-## Credits
+## More
 
-- **Model:** Qwen3.8-Flash-Next by the Qwen team.
-- **Quantization and kernels:** EXL3 quantization and exllamav3 by turboderp (MIT).
-- **Sparse attention:** the SYCL attention and selection kernels are adapted from
-  [Strata](https://github.com/Niko1221/Strata) by Niko1221 and contributors (MIT); the notice is kept in each file.
-- **Banner logo:** the Qwen mark comes from [lobe-icons](https://github.com/lobehub/lobe-icons) (MIT).
-- **Licenses:** the code in this repository is MIT, and each upstream component keeps its own license.
+- [docs/results.md](docs/results.md): every table (16 GB, 32 GB, srv20-srv26 history), NVMe and memory, quality
+- `serve/`: image entrypoint, store packer, the campaign serve script and benchmark tools (`serve/n130/`)
+- `plugin/`: SGLang exl3xpu plugin with tier mode, `exl3xpu/nvtier.py` (tiers, staged prefill, admission control)
+- `kernels/`, `experimental/`, `research/`: kernels, work in progress (victim ring, GDN prefill, MTP), analyses
+
+Known issues: the tier has a write-back race (an evicted expert can be flagged resident while its page is queued for
+release); the victim ring in `experimental/n111-victim-ring` removes it and is not in the server yet. The B70 test box
+has marginal PCIe links; no measurement here was taken during a fault window.
+
+Credits: Qwen3.8-Flash-Next by the Qwen team; EXL3 and exllamav3 by turboderp (MIT); sparse attention adapted from
+[Strata](https://github.com/Niko1221/Strata) (MIT); [SGLang](https://github.com/sgl-project/sglang). MIT license
+(this repository); the weights carry their own license.
