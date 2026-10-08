@@ -819,3 +819,49 @@ def _log_stats_n130(self, logger, every=200):
 
 
 NvTier.log_stats = _log_stats_n130
+
+
+# ---- N130: warm start of the VRAM expert cache (EXL3_NVTIER_VRAM_WARM=<experts>, default 0 = off).
+# After a cold start the device LRU is empty and every expert has to come through the small RAM tier first: the first
+# answers mask most picks (lab chat gate: a 3-word answer thought until the context ran out). With this on, warm()
+# first streams the hottest prior experts layer by layer through the RAM tier (ensure_for_prefill: O_DIRECT fill +
+# flags, RAM budget kept) and runs the cached decode kernel over them once, which writes each one through into a VRAM
+# slot; then the RAM tier is warmed with the next-hottest experts as before.
+_warm_ram = NvTier.warm
+
+
+def _warm_vram_then_ram(self, keys_ckpt, max_bytes):
+    n_vram = min(int(os.environ.get("EXL3_NVTIER_VRAM_WARM", "0")), int(getattr(self.st, "n_slots", 0) * 0.95))
+    if n_vram <= 0:
+        return _warm_ram(self, keys_ckpt, max_bytes)
+    import logging
+    t0 = time.perf_counter(); st = self.st; E = self.E; dev = self.dev
+    inv = {int(c): li for li, c in enumerate(self.ckpt)}
+    key_of = {li: k for k, li in st.layer_index.items()}
+    per = {}
+    for kc in keys_ckpt[:n_vram]:
+        li = inv.get(int(kc) // E)
+        if li is not None and li in key_of:
+            per.setdefault(li, []).append(int(kc) % E)
+    R, TOPK = 4, 10                                      # 4 rows x top-10: below the prefill threshold -> cached decode kernel
+    x = torch.zeros(R, st.H, dtype=torch.bfloat16, device=dev)
+    w = torch.full((R, TOPK), 0.1, dtype=torch.float32, device=dev)
+    n = 0
+    for li in sorted(per):
+        es = per[li]
+        for i in range(0, len(es), R * TOPK):
+            chunk = es[i:i + R * TOPK]
+            chunk = chunk + [chunk[-1]] * (R * TOPK - len(chunk))
+            ids = torch.tensor(chunk, dtype=torch.int32).reshape(R, TOPK).to(dev)
+            self.ensure_for_prefill(li, ids)
+            st.forward_cached(key_of[li], x, ids, w)
+            n += len(set(chunk))
+        torch.xpu.synchronize()
+    in_vram = int((st.slot_of_dev[: self.L * E] >= 0).sum().item())
+    logging.getLogger("exl3xpu").warning("nvtier N130 VRAM warm start: %d prior experts streamed, %d VRAM-resident, %.1f s",
+                                         n, in_vram, time.perf_counter() - t0)
+    rest = [k for k in keys_ckpt[n_vram:]]
+    return _warm_ram(self, rest, max_bytes)
+
+
+NvTier.warm = _warm_vram_then_ram
