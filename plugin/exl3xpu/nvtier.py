@@ -638,3 +638,230 @@ def _stage_forward(self, store, key, li, x, ids, w):
 NvTier._stage_setup = _stage_setup
 NvTier._stage_kick = _stage_kick
 NvTier.stage_forward = _stage_forward
+
+
+# ---- N130: decode-fill queue depth (EXL3_NVTIER_DECODE_FILL_QUEUES=N, default 1 = unchanged single worker).
+# N workers, each with its own FIFO; a key's fill and punch always go to the same worker (key % N), so the
+# per-key order (punch queued before a later re-fill) is the same as with one worker. Up to N O_DIRECT reads in flight.
+import queue as _queue, threading as _threading
+
+
+class _RouterQ:
+    def __init__(self, qs): self.qs = qs
+    def get(self): return self.qs[0].get()          # the original NvTierFast._worker reads self.q.get() -> queue 0
+    def empty(self): return all(q.empty() for q in self.qs)
+    def put(self, item):
+        op, key = item
+        if op == "stop":
+            for q in self.qs: q.put(item)
+        else:
+            self.qs[int(key) % len(self.qs)].put(item)
+
+
+def _worker_q(self, q):
+    buf = mmap.mmap(-1, self.rec); bufp = ctypes.addressof(ctypes.c_char.from_buffer(buf))
+    while True:
+        op, key = q.get()
+        if op == "fill":
+            t = time.perf_counter()
+            n = os.preadv(self.nfd, [buf], self.rec_index(key) * self.rec); assert n == self.rec
+            ctypes.memmove(self.st.addr(key), bufp, self.blob)
+            self.done.put(key)
+            self.stats["nvme_reads"] += 1; self.stats["nvme_ms"] += (time.perf_counter() - t) * 1e3
+        elif op == "punch":
+            if not getattr(self, "no_punch", False) and not self.res[key]: self._punch(key)
+        elif op == "stop":
+            return
+
+
+_fast_init = NvTierFast.__init__
+
+
+def _fast_init_n130(self, *a, **k):
+    _fast_init(self, *a, **k)
+    nq = int(os.environ.get("EXL3_NVTIER_DECODE_FILL_QUEUES", "1"))
+    if nq > 1:
+        q0 = self.q                                  # worker 0 = the original thread, keeps consuming q0
+        qs = [q0] + [_queue.Queue() for _ in range(nq - 1)]
+        self._ths = [_threading.Thread(target=_worker_q, args=(self, q), daemon=True) for q in qs[1:]]
+        for th in self._ths: th.start()
+        self.q = _RouterQ(qs)
+        import logging
+        logging.getLogger("exl3xpu").warning("nvtier N130: %d decode-fill queues", nq)
+
+
+NvTierFast.__init__ = _fast_init_n130
+
+
+# ---- N130: admission-controlled decode tier (EXL3_NVTIER_ADMIT=1; unset = the srv23 NvTierAsync.step unchanged).
+# Failure it fixes (N110 attempt 1, N130 s16b): when the cold decode working set exceeds the RAM budget, queued fills
+# (inflight) reserve the whole budget, every completed fill is the oldest non-VRAM key and is evicted before the GPU
+# reads it, punches queue behind the fill backlog (memfd grows past the budget), and the tier collapses to
+# ~0.1 GB resident with ~470 of 480 picks masked per step (garbage / runaway text).
+# Policy: (1) evict RAM copies of VRAM-resident experts first (as before); (2) evict other keys only once they are at
+# least ADMIT_AGE steps old (a fresh fill gets time to be read and promoted to VRAM); (3) admit new fills only into
+# free budget, at most ADMIT_QMAX in flight, most-missed keys first; the rest stay masked and are re-logged on their
+# next miss.
+_async_step_orig = NvTierAsync.step
+
+
+def _async_step_admit(self):
+    if os.environ.get("EXL3_NVTIER_ADMIT", "0") != "1":
+        return _async_step_orig(self)
+    AGE = int(os.environ.get("EXL3_NVTIER_ADMIT_AGE", "4")); QMAX = int(os.environ.get("EXL3_NVTIER_ADMIT_QMAX", "256"))
+    t0 = time.perf_counter()
+    self.tick += 1
+    if getattr(self, "_t_end", None) is not None:
+        self.stats["outside_ms"] = self.stats.get("outside_ms", 0.0) + (t0 - self._t_end) * 1e3
+    n = self._n
+    cur = torch.xpu.current_stream()
+    k = self._k; self._k ^= 1
+    self._h_res[k].copy_(self.res_dev[:n], non_blocking=True)
+    self._h_ring[k].copy_(self.ring, non_blocking=True)
+    self._h_slot[k].copy_(self.st.slot_of_dev[:n], non_blocking=True)
+    ev = torch.xpu.Event(); ev.record(cur); self._snap_ev[k] = ev
+    j = k ^ 1
+    if self._snap_ev[j] is None:
+        self._t_end = time.perf_counter(); self.stats["steps"] += 1
+        return 0
+    t_s = time.perf_counter()
+    self._snap_ev[j].synchronize()
+    self.stats["sync_ms"] = self.stats.get("sync_ms", 0.0) + (time.perf_counter() - t_s) * 1e3
+    res_d = self._h_res[j].numpy().copy()
+    if self._last_diff is not None:
+        dk, dv = self._last_diff
+        res_d[dk] = dv
+    ring = self._h_ring[j].numpy()
+    vram = self._h_slot[j].numpy() >= 0
+    keep = []
+    for ce, keys in self._clears:
+        if ce.query():
+            for kk in keys.tolist():
+                if res_d[kk]:
+                    self.stats["evict_rescued"] = self.stats.get("evict_rescued", 0) + 1
+                else:
+                    self.q.put(("punch", kk))
+        else:
+            keep.append((ce, keys))
+    self._clears = keep
+    newly = (res_d == 1) & (self.res == 0)
+    self.age[newly] = self.tick
+    if hasattr(self, "transient"): self.transient[newly] = False
+    res = self.res.copy()
+    res[newly] = 1
+    while not self.done.empty():
+        kk = self.done.get(); res[kk] = 1; self.age[kk] = self.tick; self.inflight[kk] = False
+    # new misses (with multiplicity -> priority)
+    cnt = int(ring[0]); newm = cnt - self.ring_seen
+    cap = self.ring.numel() - 1
+    if newm > cap: self.stats["ring_overflow"] += newm - cap; newm = cap
+    want = np.zeros(0, dtype=np.int64)
+    if newm > 0:
+        lo = (cnt - newm) % cap; hi = cnt % cap
+        r = ring[1:]
+        keys = np.concatenate([r[lo:], r[:hi]]) if hi <= lo else r[lo:hi]
+        u, c = np.unique(keys[:newm].astype(np.int64), return_counts=True)
+        ok = (res[u] == 0) & (~self.inflight[u])
+        u, c = u[ok], c[ok]
+        want = u[np.argsort(-c, kind="stable")]
+    self.ring_seen = cnt; self.stats["masked"] += max(0, newm)
+    # budget: VRAM duplicates first, then non-VRAM keys older than AGE steps
+    inflight_n = int(self.inflight.sum())
+    over = int(res.sum()) + inflight_n + len(want) - self.budget
+    ev_keys = np.zeros(0, dtype=np.int64)
+    if over > 0:
+        cand1 = np.nonzero((res == 1) & vram & ~self.pin_mask)[0]
+        take1 = cand1[np.argsort(self.age[cand1])[:over]]
+        over -= len(take1)
+        take2 = np.zeros(0, dtype=np.int64)
+        if over > 0:
+            m = (res == 1) & ~self.pin_mask & (self.age <= self.tick - AGE); m[take1] = False
+            cand2 = np.nonzero(m)[0]
+            take2 = cand2[np.argsort(self.age[cand2])[:over]]
+        ev_keys = np.concatenate([take1, take2]).astype(np.int64)
+        res[ev_keys] = 0
+        self.stats["evicts"] += len(ev_keys)
+    free = min(self.budget - int(res.sum()) - inflight_n, QMAX - inflight_n)
+    adm = want[:max(0, free)]
+    self.stats["admit_dropped"] = self.stats.get("admit_dropped", 0) + (len(want) - len(adm))
+    for kk in adm.tolist():
+        self.inflight[kk] = True; self.q.put(("fill", kk))
+    diff = np.nonzero(res != res_d)[0].astype(np.int64)
+    if len(diff):
+        idx = torch.from_numpy(diff).pin_memory().to(self.dev, non_blocking=True)
+        val = torch.from_numpy(res[diff].copy()).pin_memory().to(self.dev, non_blocking=True)
+        self.res_dev.index_copy_(0, idx, val)
+        self._last_diff = (diff, res[diff].copy())
+    else:
+        self._last_diff = None
+    if len(ev_keys):
+        ce = torch.xpu.Event(); ce.record(cur); self._clears.append((ce, ev_keys))
+    self.res = res
+    self.stats["steps"] += 1
+    self._t_end = time.perf_counter()
+    self.stats["fill_ms"] += (self._t_end - t0) * 1e3
+    return int(max(0, newm))
+
+
+NvTierAsync.step = _async_step_admit
+
+
+_log_stats_orig = NvTier.log_stats
+
+
+def _log_stats_n130(self, logger, every=200):
+    if not (self.stats["steps"] % every or not self.stats["steps"]):
+        import logging
+        logging.getLogger("exl3xpu").info("exl3xpu: nvtier N130 inflight %d admit_dropped(total) %d memfd %.2f GB",
+                                          int(self.inflight.sum()) if hasattr(self, "inflight") else -1,
+                                          self.stats.get("admit_dropped", 0), os.fstat(self.st.fd).st_blocks * 512 / 2 ** 30)
+    return _log_stats_orig(self, logger, every)
+
+
+NvTier.log_stats = _log_stats_n130
+
+
+# ---- N130: warm start of the VRAM expert cache (EXL3_NVTIER_VRAM_WARM=<experts>, default 0 = off).
+# After a cold start the device LRU is empty and every expert has to come through the small RAM tier first: the first
+# answers mask most picks (lab chat gate: a 3-word answer thought until the context ran out). With this on, warm()
+# first streams the hottest prior experts layer by layer through the RAM tier (ensure_for_prefill: O_DIRECT fill +
+# flags, RAM budget kept) and runs the cached decode kernel over them once, which writes each one through into a VRAM
+# slot; then the RAM tier is warmed with the next-hottest experts as before.
+_warm_ram = NvTier.warm
+
+
+def _warm_vram_then_ram(self, keys_ckpt, max_bytes):
+    n_vram = min(int(os.environ.get("EXL3_NVTIER_VRAM_WARM", "0")), int(getattr(self.st, "n_slots", 0) * 0.95))
+    if n_vram <= 0:
+        return _warm_ram(self, keys_ckpt, max_bytes)
+    import logging
+    t0 = time.perf_counter(); st = self.st; E = self.E; dev = self.dev
+    inv = {int(c): li for li, c in enumerate(self.ckpt)}
+    key_of = {li: k for k, li in st.layer_index.items()}
+    per = {}
+    for kc in keys_ckpt[:n_vram]:
+        li = inv.get(int(kc) // E)
+        if li is not None and li in key_of:
+            per.setdefault(li, []).append(int(kc) % E)
+    R, TOPK = 4, 10                                      # 4 rows x top-10: below the prefill threshold -> cached decode kernel
+    x = torch.zeros(R, st.H, dtype=torch.bfloat16, device=dev)
+    w = torch.full((R, TOPK), 0.1, dtype=torch.float32, device=dev)
+    n = 0
+    for li in sorted(per):
+        es = per[li]
+        for i in range(0, len(es), R * TOPK):
+            chunk = es[i:i + R * TOPK]
+            chunk = chunk + [chunk[-1]] * (R * TOPK - len(chunk))
+            ids = torch.tensor(chunk, dtype=torch.int32).reshape(R, TOPK).to(dev)
+            self.ensure_for_prefill(li, ids)
+            st.forward_cached(key_of[li], x, ids, w)
+            n += len(set(chunk))
+        torch.xpu.synchronize()
+    in_vram = int((st.slot_of_dev[: self.L * E] >= 0).sum().item())
+    logging.getLogger("exl3xpu").warning("nvtier N130 VRAM warm start: %d prior experts streamed, %d VRAM-resident, %.1f s",
+                                         n, in_vram, time.perf_counter() - t0)
+    rest = [k for k in keys_ckpt[n_vram:]]
+    return _warm_ram(self, rest, max_bytes)
+
+
+NvTier.warm = _warm_vram_then_ram

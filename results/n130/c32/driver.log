@@ -1,0 +1,23 @@
+[2026-10-08 15:58:56] guard pre count=0 path_corrected_10min=0 dev='' pciehp='' aer='' mce='' dstate10s=''
+[2026-10-08 15:58:56] waiting for ~/nvx_bench.lock
+[2026-10-08 15:58:56] nvx lock held
+[2026-10-08 15:59:06] guard pre-locked count=0 path_corrected_10min=0 dev='' pciehp='' aer='' mce='' dstate10s=''
+[2026-10-08 15:59:06] launched: MEM=32g HOSTBUF=5 RAM_GB=7 STAGE=1 NVASYNC=1 HCXPU=1 MAXTOT=131072 CHUNK=8192 MAXRUN=4 MAMBA=32 SLOTS=8000 GRAPH_BS=1,2,4 QSAIMPL=sycl_row QSASELECT=sycl
+[2026-10-08 16:01:27] ready: [2026-10-08 14:01:18] max_total_num_tokens=131072, chunked_prefill_size=8192, max_prefill_tokens=16384, max_running_requests=4, context_len=65536, available_gpu_mem=7.76 GB
+[2026-10-08 16:01:37] guard ready count=0 path_corrected_10min=0 dev='' pciehp='' aer='' mce='' dstate10s=''
+[2026-10-08 16:02:27] warm-up (not scored) rc=0 {"s": 32.2, "completion": 479, "text": "A hash map (or hash table) handles collisions\u2014when two different keys produce the same hash index\u2014using one of
+[2026-10-08 16:03:01] smoke rc=0
+[2026-10-08 16:03:11] guard smoke count=0 path_corrected_10min=0 dev='' pciehp='' aer='' mce='' dstate10s=''
+[2026-10-08 16:05:19] greedy rc=0 {"exact": 0, "n": 8, "prefix_frac": 0.0268}
+[2026-10-08 16:05:29] guard greedy count=0 path_corrected_10min=0 dev='' pciehp='' aer='' mce='' dstate10s=''
+[2026-10-08 16:07:17] refpanel rc=0 {"positions": 3001, "top1_agreement": 0.9733422192602466, "mean_kl_top20": 0.010793043488463532}
+[2026-10-08 16:07:27] guard refpanel count=0 path_corrected_10min=0 dev='' pciehp='' aer='' mce='' dstate10s=''
+[2026-10-08 16:15:09] matrix rc=0
+[2026-10-08 16:15:19] guard matrix count=0 path_corrected_10min=0 dev='' pciehp='' aer='' mce='' dstate10s=''
+ast 200 steps: masked/step 13.68 nvme/step 11.18 evicts/step 46.2 host ms/step 0.73 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 6.9 GB (memfd allocated 7.3 GB) | per step: outside 64.9 ms, sync-wait 0.0 ms, host work 0.7 ms
+ast 200 steps: masked/step 14.07 nvme/step 11.99 evicts/step 41.3 host ms/step 1.14 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 7.0 GB (memfd allocated 7.0 GB) | per step: outside 57.9 ms, sync-wait 0.4 ms, host work 0.7 ms
+ nvtier prefill prof: calls 48 fills 5057 (9.4 GB) pre(evict) 363 ms fill 433 ms (21.8 GB/s) post(prefetch+flags) 68 ms between-calls 23019 ms
+ nvtier prefill prof: calls 48 fills 11331 (21.1 GB) pre(evict) 1066 ms fill 863 ms (24.5 GB/s) post(prefetch+flags) 122 ms between-calls 346402 ms
+[2026-10-08 16:15:34] stopped
+[2026-10-08 16:15:45] guard post count=0 path_corrected_10min=0 dev='' pciehp='' aer='' mce='' dstate10s=''
+[2026-10-08 16:15:45] DONE

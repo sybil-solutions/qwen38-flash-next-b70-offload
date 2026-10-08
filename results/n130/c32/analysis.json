@@ -1,0 +1,300 @@
+{
+ "cells": [
+  {
+   "ctx": 1024,
+   "conc": 1,
+   "prefill_tok_s": 202.8,
+   "decode": 21.36,
+   "decode_per_stream": [
+    21.36
+   ],
+   "completion": [
+    930
+   ],
+   "ttft_s": [
+    4.64
+   ],
+   "prefill_win": {
+    "s": 4.0,
+    "gbs": 6.27,
+    "pct": 24.1,
+    "peak_gbs": 12.44,
+    "iops": 51099,
+    "avg_kb": 120,
+    "gpu_busy": 52.5,
+    "mem_peak_gib": 31.4,
+    "anon_peak_gib": 9.41,
+    "shmem_peak_gib": 11.06
+   },
+   "decode_win": {
+    "s": 42.0,
+    "gbs": 0.49,
+    "pct": 1.9,
+    "peak_gbs": 1.35,
+    "iops": 4247,
+    "avg_kb": 113,
+    "gpu_busy": 100.0,
+    "mem_peak_gib": 32.0,
+    "anon_peak_gib": 9.4,
+    "shmem_peak_gib": 11.95
+   }
+  },
+  {
+   "ctx": 8192,
+   "conc": 1,
+   "prefill_tok_s": 1029.5,
+   "decode": 23.35,
+   "decode_per_stream": [
+    23.35
+   ],
+   "completion": [
+    747
+   ],
+   "ttft_s": [
+    7.19
+   ],
+   "prefill_win": {
+    "s": 7.0,
+    "gbs": 4.42,
+    "pct": 17.0,
+    "peak_gbs": 6.93,
+    "iops": 36025,
+    "avg_kb": 120,
+    "gpu_busy": 71.0,
+    "mem_peak_gib": 31.63,
+    "anon_peak_gib": 9.4,
+    "shmem_peak_gib": 11.74
+   },
+   "decode_win": {
+    "s": 31.0,
+    "gbs": 0.44,
+    "pct": 1.7,
+    "peak_gbs": 0.96,
+    "iops": 3806,
+    "avg_kb": 113,
+    "gpu_busy": 100.0,
+    "mem_peak_gib": 31.59,
+    "anon_peak_gib": 9.4,
+    "shmem_peak_gib": 11.71
+   }
+  },
+  {
+   "ctx": 8192,
+   "conc": 1,
+   "prefill_tok_s": 1134.7,
+   "decode": 25.61,
+   "decode_per_stream": [
+    25.61
+   ],
+   "completion": [
+    763
+   ],
+   "ttft_s": [
+    7.21
+   ],
+   "prefill_win": {
+    "s": 6.0,
+    "gbs": 4.46,
+    "pct": 17.2,
+    "peak_gbs": 6.44,
+    "iops": 36373,
+    "avg_kb": 120,
+    "gpu_busy": 68.9,
+    "mem_peak_gib": 31.54,
+    "anon_peak_gib": 9.4,
+    "shmem_peak_gib": 11.69
+   },
+   "decode_win": {
+    "s": 29.0,
+    "gbs": 0.34,
+    "pct": 1.3,
+    "peak_gbs": 0.69,
+    "iops": 2966,
+    "avg_kb": 113,
+    "gpu_busy": 100.0,
+    "mem_peak_gib": 31.62,
+    "anon_peak_gib": 9.4,
+    "shmem_peak_gib": 11.77
+   }
+  },
+  {
+   "ctx": 8192,
+   "conc": 2,
+   "prefill_tok_s": 1143.3,
+   "decode": 30.5,
+   "decode_per_stream": [
+    15.21,
+    15.94
+   ],
+   "completion": [
+    652,
+    743
+   ],
+   "ttft_s": [
+    14.17,
+    14.31
+   ],
+   "prefill_win": {
+    "s": 13.0,
+    "gbs": 4.44,
+    "pct": 17.1,
+    "peak_gbs": 6.85,
+    "iops": 36175,
+    "avg_kb": 120,
+    "gpu_busy": 73.0,
+    "mem_peak_gib": 31.85,
+    "anon_peak_gib": 9.4,
+    "shmem_peak_gib": 12.0
+   },
+   "decode_win": {
+    "s": 42.0,
+    "gbs": 0.49,
+    "pct": 1.9,
+    "peak_gbs": 0.9,
+    "iops": 4208,
+    "avg_kb": 113,
+    "gpu_busy": 100.0,
+    "mem_peak_gib": 31.94,
+    "anon_peak_gib": 9.4,
+    "shmem_peak_gib": 12.09
+   }
+  },
+  {
+   "ctx": 8192,
+   "conc": 4,
+   "prefill_tok_s": 1289.9,
+   "decode": 32.43,
+   "decode_per_stream": [
+    7.63,
+    7.51,
+    8.11,
+    8.12
+   ],
+   "completion": [
+    791,
+    848,
+    779,
+    783
+   ],
+   "ttft_s": [
+    19.19,
+    12.33,
+    25.28,
+    25.38
+   ],
+   "prefill_win": {
+    "s": 24.0,
+    "gbs": 4.97,
+    "pct": 19.1,
+    "peak_gbs": 6.78,
+    "iops": 40477,
+    "avg_kb": 120,
+    "gpu_busy": 81.5,
+    "mem_peak_gib": 31.74,
+    "anon_peak_gib": 9.4,
+    "shmem_peak_gib": 11.93
+   },
+   "decode_win": {
+    "s": 95.0,
+    "gbs": 0.7,
+    "pct": 2.7,
+    "peak_gbs": 1.36,
+    "iops": 6060,
+    "avg_kb": 113,
+    "gpu_busy": 100.0,
+    "mem_peak_gib": 31.96,
+    "anon_peak_gib": 9.4,
+    "shmem_peak_gib": 12.54
+   }
+  },
+  {
+   "ctx": 32768,
+   "conc": 1,
+   "prefill_tok_s": 1193.4,
+   "decode": 27.33,
+   "decode_per_stream": [
+    27.33
+   ],
+   "completion": [
+    650
+   ],
+   "ttft_s": [
+    27.59
+   ],
+   "prefill_win": {
+    "s": 26.0,
+    "gbs": 5.12,
+    "pct": 19.7,
+    "peak_gbs": 8.77,
+    "iops": 41726,
+    "avg_kb": 120,
+    "gpu_busy": 83.9,
+    "mem_peak_gib": 30.37,
+    "anon_peak_gib": 9.4,
+    "shmem_peak_gib": 11.52
+   },
+   "decode_win": {
+    "s": 23.0,
+    "gbs": 0.36,
+    "pct": 1.4,
+    "peak_gbs": 1.19,
+    "iops": 3100,
+    "avg_kb": 113,
+    "gpu_busy": 100.0,
+    "mem_peak_gib": 30.37,
+    "anon_peak_gib": 9.4,
+    "shmem_peak_gib": 11.52
+   }
+  },
+  {
+   "ctx": 32768,
+   "conc": 2,
+   "prefill_tok_s": 1321.0,
+   "decode": 31.34,
+   "decode_per_stream": [
+    15.68,
+    12.64
+   ],
+   "completion": [
+    703,
+    836
+   ],
+   "ttft_s": [
+    49.85,
+    33.83
+   ],
+   "prefill_win": {
+    "s": 49.0,
+    "gbs": 5.63,
+    "pct": 21.7,
+    "peak_gbs": 9.17,
+    "iops": 45903,
+    "avg_kb": 120,
+    "gpu_busy": 91.9,
+    "mem_peak_gib": 30.86,
+    "anon_peak_gib": 9.4,
+    "shmem_peak_gib": 12.01
+   },
+   "decode_win": {
+    "s": 44.0,
+    "gbs": 0.42,
+    "pct": 1.6,
+    "peak_gbs": 1.41,
+    "iops": 3623,
+    "avg_kb": 113,
+    "gpu_busy": 100.0,
+    "mem_peak_gib": 30.71,
+    "anon_peak_gib": 9.4,
+    "shmem_peak_gib": 11.86
+   }
+  }
+ ],
+ "summary": {
+  "mem_peak_gib": 32.0,
+  "anon_peak_gib": 9.51,
+  "shmem_peak_gib": 22.98,
+  "cgroup_peak_gib": 32.0,
+  "oom_kill": 1,
+  "swap_max": 0
+ }
+}

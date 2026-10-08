@@ -1,0 +1,29 @@
+{"i": 0, "gen_tokens": 586, "finish": {"type": "stop", "matched": 248046}, "top1": 0.962457337883959, "kl": 0.011329711974114408, "kl_p99": 0.1649261390535828, "kl_max": 0.34078582879093355}
+{"i": 1, "gen_tokens": 438, "finish": {"type": "stop", "matched": 248046}, "top1": 0.9703196347031964, "kl": 0.030718975282418737, "kl_p99": 0.6463832499012973, "kl_max": 1.6049701363089959}
+{"i": 2, "gen_tokens": 20, "finish": {"type": "stop", "matched": 248046}, "top1": 0.95, "kl": 0.1093690371581241, "kl_p99": 0.865611936304219, "kl_max": 0.958594654195594}
+{"i": 3, "gen_tokens": 425, "finish": {"type": "stop", "matched": 248046}, "top1": 0.9811764705882353, "kl": 0.01095894192264595, "kl_p99": 0.17471500535205636, "kl_max": 0.624361014127697}
+{"i": 4, "gen_tokens": 283, "finish": {"type": "stop", "matched": 248046}, "top1": 0.9540636042402827, "kl": 0.02099630989230117, "kl_p99": 0.39114225446978734, "kl_max": 0.5015086028674755}
+{"i": 5, "gen_tokens": 622, "finish": {"type": "stop", "matched": 248046}, "top1": 0.9517684887459807, "kl": 0.02521953975691404, "kl_p99": 0.29205739639991296, "kl_max": 1.350799210942884}
+Traceback (most recent call last):
+  File "/home/sero/freetoken-exl3/runs/N130-16g/decode_kl_n130.py", line 24, in <module>
+    t = post("/generate", {"input_ids": prompt + gen, "return_logprob": True, "logprob_start_len": P - 1, "top_logprobs_num": 20,
+                           "token_ids_logprob": support, "sampling_params": {"temperature": 0, "max_new_tokens": 1}})
+  File "/home/sero/freetoken-exl3/runs/N130-16g/decode_kl_n130.py", line 11, in post
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/urllib/request.py", line 187, in urlopen
+    return opener.open(url, data, timeout)
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/urllib/request.py", line 493, in open
+    response = meth(req, response)
+  File "/usr/lib/python3.14/urllib/request.py", line 602, in http_response
+    response = self.parent.error(
+        'http', request, response, code, msg, hdrs)
+  File "/usr/lib/python3.14/urllib/request.py", line 531, in error
+    return self._call_chain(*args)
+           ~~~~~~~~~~~~~~~~^^^^^^^
+  File "/usr/lib/python3.14/urllib/request.py", line 464, in _call_chain
+    result = func(*args)
+  File "/usr/lib/python3.14/urllib/request.py", line 611, in http_error_default
+    raise HTTPError(req.full_url, code, msg, hdrs, fp)
+urllib.error.HTTPError: HTTP Error 500: Internal Server Error

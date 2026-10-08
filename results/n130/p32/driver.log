@@ -1,0 +1,24 @@
+[2026-10-08 16:41:32] guard pre count=0 path_corrected_10min=0 dev='' pciehp='' aer='' mce='' dstate10s=''
+[2026-10-08 16:41:32] waiting for ~/nvx_bench.lock
+[2026-10-08 16:42:10] nvx lock held
+[2026-10-08 16:42:20] guard pre-locked count=0 path_corrected_10min=0 dev='' pciehp='' aer='' mce='' dstate10s=''
+[2026-10-08 16:42:20] launched: MEM=32g HOSTBUF=5 RAM_GB=7 STAGE=1 NVASYNC=1 HCXPU=1 MAXTOT=131072 CHUNK=8192 MAXRUN=4 MAMBA=32 SLOTS=8000 GRAPH_BS=1,2,4 QSAIMPL=sycl_row QSASELECT=sycl
+[2026-10-08 16:44:50] ready: [2026-10-08 14:44:44] max_total_num_tokens=131072, chunked_prefill_size=8192, max_prefill_tokens=16384, max_running_requests=4, context_len=65536, available_gpu_mem=7.76 GB
+[2026-10-08 16:45:00] guard ready count=0 path_corrected_10min=0 dev='' pciehp='' aer='' mce='' dstate10s=''
+[2026-10-08 16:45:20] flush_cache rc=0
+[2026-10-08 16:47:20] refpanel(clean) rc=0 {"positions": 3001, "top1_agreement": 0.9843385538153949, "mean_kl_top20": 0.002819426406658236}
+[2026-10-08 16:47:30] guard refpanel count=0 path_corrected_10min=0 dev='' pciehp='' aer='' mce='' dstate10s=''
+[2026-10-08 16:47:30] flush_cache rc=0
+[2026-10-08 16:48:03] refpanel(clean repeat) rc=0 {"positions": 3001, "top1_agreement": 0.9820059980006665, "mean_kl_top20": 0.008462736158163882}
+[2026-10-08 16:48:13] guard refpanel2 count=0 path_corrected_10min=0 dev='' pciehp='' aer='' mce='' dstate10s=''
+[2026-10-08 16:49:34] warm-up (not scored) rc=0
+[2026-10-08 16:49:34] flush_cache rc=0
+[2026-10-08 16:55:08] decode_kl rc=1 urllib.error.HTTPError: HTTP Error 500: Internal Server Error
+[2026-10-08 16:55:18] guard decode_kl count=0 path_corrected_10min=0 dev='' pciehp='' aer='' mce='' dstate10s=''
+ast 200 steps: masked/step 28.98 nvme/step 23.93 evicts/step 52.3 host ms/step 0.85 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 7.0 GB (memfd allocated 7.1 GB) | per step: outside 54.1 ms, sync-wait 0.0 ms, host work 0.8 ms
+ast 200 steps: masked/step 24.93 nvme/step 21.62 evicts/step 53.5 host ms/step 0.85 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 7.0 GB (memfd allocated 7.2 GB) | per step: outside 57.0 ms, sync-wait 0.0 ms, host work 0.8 ms
+ nvtier prefill prof: calls 48 fills 3662 (6.8 GB) pre(evict) 285 ms fill 319 ms (21.4 GB/s) post(prefetch+flags) 48 ms between-calls 21062 ms
+ nvtier prefill prof: calls 48 fills 4311 (8.0 GB) pre(evict) 328 ms fill 387 ms (20.8 GB/s) post(prefetch+flags) 59 ms between-calls 41442 ms
+[2026-10-08 16:55:18] stopped
+[2026-10-08 16:55:29] guard post count=0 path_corrected_10min=0 dev='' pciehp='' aer='' mce='' dstate10s=''
+[2026-10-08 16:55:29] DONE

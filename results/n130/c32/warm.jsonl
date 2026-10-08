@@ -1,0 +1,2 @@
+{"s": 17.6, "completion": 446, "text": "Elias, the solitary lighthouse keeper, lived in a stone cottage at the edge of the world. The sea was a vast, grey expanse that roared against the rocks, a relentless rhythm that defined his days. For"}
+{"s": 32.2, "completion": 479, "text": "A hash map (or hash table) handles collisions\u2014when two different keys produce the same hash index\u2014using one of two main strategies: |  | 1. **Chaining**: Each bucket holds a linked list (or another collec"}

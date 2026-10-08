@@ -1,0 +1,119 @@
+[2026-10-08 13:45:43] nvtier prefill prof: calls 48 fills 11159 (20.8 GB) pre(evict) 1227 ms fill 864 ms (24.1 GB/s) post(prefetch+flags) 111 ms between-calls 4068 ms
+[2026-10-08 13:45:49] nvtier prefill prof: calls 48 fills 5249 (9.8 GB) pre(evict) 513 ms fill 444 ms (22.0 GB/s) post(prefetch+flags) 64 ms between-calls 4986 ms
+[2026-10-08 13:45:55] nvtier prefill prof: calls 48 fills 4515 (8.4 GB) pre(evict) 361 ms fill 390 ms (21.6 GB/s) post(prefetch+flags) 56 ms between-calls 4845 ms
+[2026-10-08 13:45:59] exl3xpu: nvtier N130 inflight 41 admit_dropped(total) 2965 memfd 2.13 GB
+[2026-10-08 13:45:59] exl3xpu: nvtier last 200 steps: masked/step 167.74 nvme/step 189.87 evicts/step 83.5 host ms/step 1.26 prefill fills 20923 evicts 20729 (1378 ms) rescued 79 ram 1.9 GB (memfd allocated 2.1 GB) | per step: outside 77.1 ms, sync-wait 0.0 ms, host work 1.2 ms
+[2026-10-08 13:46:08] exl3xpu: nvtier N130 inflight 22 admit_dropped(total) 2965 memfd 2.22 GB
+[2026-10-08 13:46:08] exl3xpu: nvtier last 200 steps: masked/step 59.96 nvme/step 46.63 evicts/step 60.0 host ms/step 1.07 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 2.0 GB (memfd allocated 2.2 GB) | per step: outside 44.3 ms, sync-wait 0.0 ms, host work 1.1 ms
+[2026-10-08 13:46:16] exl3xpu: nvtier N130 inflight 9 admit_dropped(total) 2965 memfd 2.08 GB
+[2026-10-08 13:46:16] exl3xpu: nvtier last 200 steps: masked/step 49.16 nvme/step 42.54 evicts/step 54.8 host ms/step 1.09 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 2.0 GB (memfd allocated 2.1 GB) | per step: outside 40.5 ms, sync-wait 0.0 ms, host work 1.1 ms
+[2026-10-08 13:46:25] exl3xpu: nvtier N130 inflight 21 admit_dropped(total) 2965 memfd 2.07 GB
+[2026-10-08 13:46:25] exl3xpu: nvtier last 200 steps: masked/step 46.48 nvme/step 38.74 evicts/step 52.6 host ms/step 1.12 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 2.0 GB (memfd allocated 2.1 GB) | per step: outside 40.8 ms, sync-wait 0.0 ms, host work 1.1 ms
+[2026-10-08 13:46:33] exl3xpu: nvtier N130 inflight 43 admit_dropped(total) 2965 memfd 2.12 GB
+[2026-10-08 13:46:33] exl3xpu: nvtier last 200 steps: masked/step 45.87 nvme/step 41.09 evicts/step 55.6 host ms/step 1.02 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 1.9 GB (memfd allocated 2.1 GB) | per step: outside 40.4 ms, sync-wait 0.0 ms, host work 1.0 ms
+[2026-10-08 13:46:42] exl3xpu: nvtier N130 inflight 68 admit_dropped(total) 2965 memfd 2.08 GB
+[2026-10-08 13:46:42] exl3xpu: nvtier last 200 steps: masked/step 73.83 nvme/step 58.80 evicts/step 78.2 host ms/step 1.27 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 1.9 GB (memfd allocated 2.1 GB) | per step: outside 45.3 ms, sync-wait 0.0 ms, host work 1.3 ms
+[2026-10-08 13:46:46] nvtier prefill prof: calls 48 fills 4069 (7.6 GB) pre(evict) 295 ms fill 348 ms (21.8 GB/s) post(prefetch+flags) 52 ms between-calls 50530 ms
+[2026-10-08 13:46:50] nvtier prefill prof: calls 48 fills 4653 (8.7 GB) pre(evict) 324 ms fill 389 ms (22.3 GB/s) post(prefetch+flags) 56 ms between-calls 2600 ms
+[2026-10-08 13:46:58] nvtier prefill prof: calls 48 fills 5476 (10.2 GB) pre(evict) 401 ms fill 444 ms (23.0 GB/s) post(prefetch+flags) 66 ms between-calls 7509 ms
+[2026-10-08 13:47:01] exl3xpu: nvtier N130 inflight 21 admit_dropped(total) 3201 memfd 2.18 GB
+[2026-10-08 13:47:01] exl3xpu: nvtier last 200 steps: masked/step 101.84 nvme/step 148.84 evicts/step 109.0 host ms/step 1.39 prefill fills 14198 evicts 14105 (946 ms) rescued 363 ram 2.0 GB (memfd allocated 2.2 GB) | per step: outside 92.2 ms, sync-wait 0.0 ms, host work 1.4 ms
+[2026-10-08 13:47:09] exl3xpu: nvtier N130 inflight 18 admit_dropped(total) 3201 memfd 2.06 GB
+[2026-10-08 13:47:09] exl3xpu: nvtier last 200 steps: masked/step 39.17 nvme/step 31.18 evicts/step 44.6 host ms/step 1.18 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 2.0 GB (memfd allocated 2.1 GB) | per step: outside 39.6 ms, sync-wait 0.0 ms, host work 1.2 ms
+[2026-10-08 13:47:27] nvtier prefill prof: calls 48 fills 4702 (8.8 GB) pre(evict) 341 ms fill 403 ms (21.7 GB/s) post(prefetch+flags) 56 ms between-calls 28599 ms
+[2026-10-08 13:47:29] exl3xpu: nvtier N130 inflight 34 admit_dropped(total) 3204 memfd 2.17 GB
+[2026-10-08 13:47:29] exl3xpu: nvtier last 200 steps: masked/step 31.97 nvme/step 47.91 evicts/step 36.3 host ms/step 1.05 prefill fills 4702 evicts 4672 (315 ms) rescued 99 ram 1.9 GB (memfd allocated 2.2 GB) | per step: outside 97.0 ms, sync-wait 0.0 ms, host work 1.0 ms
+[2026-10-08 13:47:37] exl3xpu: nvtier N130 inflight 22 admit_dropped(total) 3204 memfd 2.08 GB
+[2026-10-08 13:47:37] exl3xpu: nvtier last 200 steps: masked/step 40.45 nvme/step 32.23 evicts/step 44.4 host ms/step 1.04 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 2.0 GB (memfd allocated 2.1 GB) | per step: outside 38.4 ms, sync-wait 0.0 ms, host work 1.0 ms
+[2026-10-08 13:47:45] exl3xpu: nvtier N130 inflight 85 admit_dropped(total) 3204 memfd 2.12 GB
+[2026-10-08 13:47:45] exl3xpu: nvtier last 200 steps: masked/step 37.47 nvme/step 28.17 evicts/step 40.5 host ms/step 0.99 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 1.8 GB (memfd allocated 2.1 GB) | per step: outside 38.2 ms, sync-wait 0.0 ms, host work 1.0 ms
+[2026-10-08 13:47:50] nvtier prefill prof: calls 48 fills 4719 (8.8 GB) pre(evict) 350 ms fill 384 ms (22.9 GB/s) post(prefetch+flags) 60 ms between-calls 21959 ms
+[2026-10-08 13:47:55] exl3xpu: nvtier N130 inflight 108 admit_dropped(total) 3468 memfd 2.25 GB
+[2026-10-08 13:47:55] exl3xpu: nvtier last 200 steps: masked/step 71.55 nvme/step 74.77 evicts/step 72.2 host ms/step 1.20 prefill fills 4719 evicts 4690 (314 ms) rescued 105 ram 1.8 GB (memfd allocated 2.3 GB) | per step: outside 51.3 ms, sync-wait 0.0 ms, host work 1.2 ms
+[2026-10-08 13:48:04] exl3xpu: nvtier N130 inflight 27 admit_dropped(total) 3468 memfd 2.15 GB
+[2026-10-08 13:48:04] exl3xpu: nvtier last 200 steps: masked/step 49.08 nvme/step 40.31 evicts/step 54.8 host ms/step 1.25 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 1.9 GB (memfd allocated 2.2 GB) | per step: outside 40.4 ms, sync-wait 0.0 ms, host work 1.2 ms
+[2026-10-08 13:48:06] nvtier prefill prof: calls 48 fills 5089 (9.5 GB) pre(evict) 384 ms fill 422 ms (22.5 GB/s) post(prefetch+flags) 61 ms between-calls 14868 ms
+[2026-10-08 13:48:11] nvtier prefill prof: calls 48 fills 5266 (9.8 GB) pre(evict) 377 ms fill 440 ms (22.3 GB/s) post(prefetch+flags) 64 ms between-calls 4091 ms
+[2026-10-08 13:48:18] exl3xpu: nvtier N130 inflight 25 admit_dropped(total) 3562 memfd 2.14 GB
+[2026-10-08 13:48:18] exl3xpu: nvtier last 200 steps: masked/step 62.82 nvme/step 100.07 evicts/step 70.1 host ms/step 1.12 prefill fills 10355 evicts 10315 (680 ms) rescued 250 ram 2.0 GB (memfd allocated 2.1 GB) | per step: outside 73.5 ms, sync-wait 0.0 ms, host work 1.1 ms
+[2026-10-08 13:48:26] exl3xpu: nvtier N130 inflight 22 admit_dropped(total) 3562 memfd 2.05 GB
+[2026-10-08 13:48:26] exl3xpu: nvtier last 200 steps: masked/step 37.98 nvme/step 32.27 evicts/step 43.0 host ms/step 1.11 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 2.0 GB (memfd allocated 2.0 GB) | per step: outside 36.2 ms, sync-wait 0.0 ms, host work 1.1 ms
+[2026-10-08 13:48:31] nvtier prefill prof: calls 48 fills 4842 (9.0 GB) pre(evict) 362 ms fill 395 ms (22.8 GB/s) post(prefetch+flags) 59 ms between-calls 19566 ms
+[2026-10-08 13:48:36] exl3xpu: nvtier N130 inflight 51 admit_dropped(total) 3562 memfd 2.32 GB
+[2026-10-08 13:48:36] exl3xpu: nvtier last 200 steps: masked/step 63.16 nvme/step 73.67 evicts/step 69.7 host ms/step 1.24 prefill fills 4842 evicts 4874 (331 ms) rescued 94 ram 1.9 GB (memfd allocated 2.3 GB) | per step: outside 50.2 ms, sync-wait 0.0 ms, host work 1.2 ms
+[2026-10-08 13:48:44] exl3xpu: nvtier N130 inflight 16 admit_dropped(total) 3562 memfd 2.06 GB
+[2026-10-08 13:48:44] exl3xpu: nvtier last 200 steps: masked/step 42.26 nvme/step 34.02 evicts/step 45.7 host ms/step 1.10 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 2.0 GB (memfd allocated 2.1 GB) | per step: outside 37.9 ms, sync-wait 0.0 ms, host work 1.1 ms
+[2026-10-08 13:48:46] nvtier prefill prof: calls 48 fills 4505 (8.4 GB) pre(evict) 328 ms fill 367 ms (22.9 GB/s) post(prefetch+flags) 53 ms between-calls 13899 ms
+[2026-10-08 13:48:54] exl3xpu: nvtier N130 inflight 67 admit_dropped(total) 3562 memfd 2.22 GB
+[2026-10-08 13:48:54] exl3xpu: nvtier last 200 steps: masked/step 64.08 nvme/step 69.31 evicts/step 66.0 host ms/step 1.05 prefill fills 4505 evicts 4513 (303 ms) rescued 86 ram 1.9 GB (memfd allocated 2.2 GB) | per step: outside 49.2 ms, sync-wait 0.0 ms, host work 1.0 ms
+[2026-10-08 13:49:02] exl3xpu: nvtier N130 inflight 6 admit_dropped(total) 3562 memfd 2.03 GB
+[2026-10-08 13:49:02] exl3xpu: nvtier last 200 steps: masked/step 49.10 nvme/step 38.59 evicts/step 48.9 host ms/step 1.14 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 2.0 GB (memfd allocated 2.0 GB) | per step: outside 36.2 ms, sync-wait 0.0 ms, host work 1.1 ms
+[2026-10-08 13:49:08] nvtier prefill prof: calls 48 fills 5026 (9.4 GB) pre(evict) 370 ms fill 405 ms (23.1 GB/s) post(prefetch+flags) 56 ms between-calls 21161 ms
+[2026-10-08 13:49:11] exl3xpu: nvtier N130 inflight 40 admit_dropped(total) 3562 memfd 2.33 GB
+[2026-10-08 13:49:11] exl3xpu: nvtier last 200 steps: masked/step 47.94 nvme/step 61.96 evicts/step 52.3 host ms/step 0.98 prefill fills 5026 evicts 5049 (340 ms) rescued 131 ram 1.9 GB (memfd allocated 2.3 GB) | per step: outside 45.3 ms, sync-wait 0.0 ms, host work 1.0 ms
+[2026-10-08 13:49:18] exl3xpu: nvtier N130 inflight 52 admit_dropped(total) 3562 memfd 2.00 GB
+[2026-10-08 13:49:18] exl3xpu: nvtier last 200 steps: masked/step 50.10 nvme/step 43.34 evicts/step 55.4 host ms/step 1.07 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 1.9 GB (memfd allocated 2.0 GB) | per step: outside 37.5 ms, sync-wait 0.0 ms, host work 1.1 ms
+[2026-10-08 13:49:27] exl3xpu: nvtier N130 inflight 12 admit_dropped(total) 3562 memfd 2.04 GB
+[2026-10-08 13:49:27] exl3xpu: nvtier last 200 steps: masked/step 42.63 nvme/step 34.40 evicts/step 47.3 host ms/step 1.04 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 2.0 GB (memfd allocated 2.0 GB) | per step: outside 39.1 ms, sync-wait 0.0 ms, host work 1.0 ms
+[2026-10-08 13:49:34] exl3xpu: nvtier N130 inflight 61 admit_dropped(total) 3562 memfd 2.08 GB
+[2026-10-08 13:49:34] exl3xpu: nvtier last 200 steps: masked/step 45.90 nvme/step 38.67 evicts/step 51.6 host ms/step 1.08 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 1.9 GB (memfd allocated 2.1 GB) | per step: outside 38.7 ms, sync-wait 0.0 ms, host work 1.1 ms
+[2026-10-08 13:49:43] exl3xpu: nvtier N130 inflight 31 admit_dropped(total) 3562 memfd 2.05 GB
+[2026-10-08 13:49:43] exl3xpu: nvtier last 200 steps: masked/step 50.23 nvme/step 42.35 evicts/step 56.8 host ms/step 1.02 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 1.9 GB (memfd allocated 2.0 GB) | per step: outside 40.6 ms, sync-wait 0.0 ms, host work 1.0 ms
+[2026-10-08 13:49:47] nvtier prefill prof: calls 48 fills 3847 (7.2 GB) pre(evict) 272 ms fill 328 ms (21.8 GB/s) post(prefetch+flags) 53 ms between-calls 38177 ms
+[2026-10-08 13:51:22] nvtier prefill prof: calls 48 fills 6561 (12.2 GB) pre(evict) 505 ms fill 539 ms (22.7 GB/s) post(prefetch+flags) 74 ms between-calls 94002 ms
+[2026-10-08 13:51:46] nvtier prefill prof: calls 48 fills 5659 (10.5 GB) pre(evict) 413 ms fill 477 ms (22.1 GB/s) post(prefetch+flags) 66 ms between-calls 23289 ms
+[2026-10-08 13:52:08] exl3xpu: nvtier N130 inflight 23 admit_dropped(total) 3954 memfd 2.07 GB
+[2026-10-08 13:52:08] exl3xpu: nvtier last 200 steps: masked/step 84.59 nvme/step 142.06 evicts/step 89.5 host ms/step 1.31 prefill fills 16067 evicts 16140 (1088 ms) rescued 302 ram 2.0 GB (memfd allocated 2.1 GB) | per step: outside 723.6 ms, sync-wait 0.0 ms, host work 1.3 ms
+[2026-10-08 13:52:16] exl3xpu: nvtier N130 inflight 19 admit_dropped(total) 3954 memfd 2.12 GB
+[2026-10-08 13:52:16] exl3xpu: nvtier last 200 steps: masked/step 42.05 nvme/step 33.02 evicts/step 44.2 host ms/step 1.01 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 2.0 GB (memfd allocated 2.1 GB) | per step: outside 37.5 ms, sync-wait 0.0 ms, host work 1.0 ms
+[2026-10-08 13:52:22] exl3xpu: nvtier N130 inflight 5 admit_dropped(total) 3954 memfd 2.01 GB
+[2026-10-08 13:52:22] exl3xpu: nvtier last 200 steps: masked/step 18.48 nvme/step 15.24 evicts/step 21.3 host ms/step 0.94 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 2.0 GB (memfd allocated 2.0 GB) | per step: outside 31.8 ms, sync-wait 0.0 ms, host work 0.9 ms
+[2026-10-08 13:52:29] exl3xpu: nvtier N130 inflight 12 admit_dropped(total) 3954 memfd 2.06 GB
+[2026-10-08 13:52:29] exl3xpu: nvtier last 200 steps: masked/step 18.81 nvme/step 15.63 evicts/step 21.8 host ms/step 0.90 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 2.0 GB (memfd allocated 2.1 GB) | per step: outside 32.4 ms, sync-wait 0.0 ms, host work 0.9 ms
+[2026-10-08 13:52:44] exl3xpu: nvtier N130 inflight 8 admit_dropped(total) 4022 memfd 2.02 GB
+[2026-10-08 13:52:44] exl3xpu: nvtier last 200 steps: masked/step 34.95 nvme/step 27.25 evicts/step 38.1 host ms/step 1.50 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 2.0 GB (memfd allocated 2.0 GB) | per step: outside 72.6 ms, sync-wait 0.4 ms, host work 1.1 ms
+[2026-10-08 13:52:50] exl3xpu: nvtier N130 inflight 5 admit_dropped(total) 4022 memfd 2.07 GB
+[2026-10-08 13:52:50] exl3xpu: nvtier last 200 steps: masked/step 23.74 nvme/step 18.57 evicts/step 25.8 host ms/step 0.96 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 2.0 GB (memfd allocated 2.1 GB) | per step: outside 33.4 ms, sync-wait 0.0 ms, host work 1.0 ms
+[2026-10-08 13:52:57] exl3xpu: nvtier N130 inflight 10 admit_dropped(total) 4022 memfd 2.09 GB
+[2026-10-08 13:52:57] exl3xpu: nvtier last 200 steps: masked/step 20.95 nvme/step 16.68 evicts/step 24.3 host ms/step 0.93 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 2.0 GB (memfd allocated 2.1 GB) | per step: outside 34.0 ms, sync-wait 0.0 ms, host work 0.9 ms
+[2026-10-08 13:53:04] exl3xpu: nvtier N130 inflight 9 admit_dropped(total) 4022 memfd 2.01 GB
+[2026-10-08 13:53:04] exl3xpu: nvtier last 200 steps: masked/step 17.26 nvme/step 14.38 evicts/step 20.0 host ms/step 0.91 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 2.0 GB (memfd allocated 2.0 GB) | per step: outside 32.1 ms, sync-wait 0.0 ms, host work 0.9 ms
+[2026-10-08 13:53:19] exl3xpu: nvtier N130 inflight 14 admit_dropped(total) 4059 memfd 2.10 GB
+[2026-10-08 13:53:19] exl3xpu: nvtier last 200 steps: masked/step 31.46 nvme/step 25.37 evicts/step 37.0 host ms/step 1.44 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 2.0 GB (memfd allocated 2.1 GB) | per step: outside 73.1 ms, sync-wait 0.5 ms, host work 1.0 ms
+[2026-10-08 13:53:25] exl3xpu: nvtier N130 inflight 6 admit_dropped(total) 4059 memfd 2.06 GB
+[2026-10-08 13:53:25] exl3xpu: nvtier last 200 steps: masked/step 12.71 nvme/step 10.77 evicts/step 15.4 host ms/step 0.86 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 2.0 GB (memfd allocated 2.1 GB) | per step: outside 30.6 ms, sync-wait 0.0 ms, host work 0.9 ms
+[2026-10-08 13:53:32] exl3xpu: nvtier N130 inflight 8 admit_dropped(total) 4059 memfd 2.03 GB
+[2026-10-08 13:53:32] exl3xpu: nvtier last 200 steps: masked/step 15.12 nvme/step 11.94 evicts/step 18.0 host ms/step 0.84 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 2.0 GB (memfd allocated 2.0 GB) | per step: outside 32.1 ms, sync-wait 0.0 ms, host work 0.8 ms
+[2026-10-08 13:53:39] exl3xpu: nvtier N130 inflight 17 admit_dropped(total) 4059 memfd 2.05 GB
+[2026-10-08 13:53:39] exl3xpu: nvtier last 200 steps: masked/step 17.59 nvme/step 14.59 evicts/step 21.8 host ms/step 0.89 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 2.0 GB (memfd allocated 2.0 GB) | per step: outside 33.1 ms, sync-wait 0.0 ms, host work 0.9 ms
+[2026-10-08 13:54:03] exl3xpu: nvtier N130 inflight 56 admit_dropped(total) 4204 memfd 2.14 GB
+[2026-10-08 13:54:03] exl3xpu: nvtier last 200 steps: masked/step 63.89 nvme/step 46.64 evicts/step 68.3 host ms/step 1.22 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 1.9 GB (memfd allocated 2.1 GB) | per step: outside 123.4 ms, sync-wait 0.0 ms, host work 1.2 ms
+[2026-10-08 13:54:14] exl3xpu: nvtier N130 inflight 33 admit_dropped(total) 4204 memfd 2.10 GB
+[2026-10-08 13:54:14] exl3xpu: nvtier last 200 steps: masked/step 48.73 nvme/step 37.91 evicts/step 56.0 host ms/step 1.08 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 1.9 GB (memfd allocated 2.1 GB) | per step: outside 50.4 ms, sync-wait 0.0 ms, host work 1.1 ms
+[2026-10-08 13:54:24] exl3xpu: nvtier N130 inflight 27 admit_dropped(total) 4204 memfd 2.03 GB
+[2026-10-08 13:54:24] exl3xpu: nvtier last 200 steps: masked/step 44.20 nvme/step 35.03 evicts/step 50.8 host ms/step 1.10 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 1.9 GB (memfd allocated 2.0 GB) | per step: outside 48.0 ms, sync-wait 0.0 ms, host work 1.1 ms
+[2026-10-08 13:54:59] exl3xpu: nvtier N130 inflight 54 admit_dropped(total) 5081 memfd 2.22 GB
+[2026-10-08 13:54:59] exl3xpu: nvtier last 200 steps: masked/step 68.06 nvme/step 46.60 evicts/step 66.2 host ms/step 1.57 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 1.9 GB (memfd allocated 2.2 GB) | per step: outside 175.1 ms, sync-wait 0.4 ms, host work 1.1 ms
+[2026-10-08 13:55:15] exl3xpu: nvtier N130 inflight 104 admit_dropped(total) 5387 memfd 2.29 GB
+[2026-10-08 13:55:15] exl3xpu: nvtier last 200 steps: masked/step 133.07 nvme/step 99.02 evicts/step 137.1 host ms/step 1.56 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 1.8 GB (memfd allocated 2.3 GB) | per step: outside 76.8 ms, sync-wait 0.0 ms, host work 1.6 ms
+[2026-10-08 13:55:30] exl3xpu: nvtier N130 inflight 75 admit_dropped(total) 5736 memfd 2.24 GB
+[2026-10-08 13:55:30] exl3xpu: nvtier last 200 steps: masked/step 135.82 nvme/step 103.31 evicts/step 137.9 host ms/step 1.41 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 1.9 GB (memfd allocated 2.2 GB) | per step: outside 75.0 ms, sync-wait 0.0 ms, host work 1.4 ms
+[2026-10-08 13:55:45] exl3xpu: nvtier N130 inflight 61 admit_dropped(total) 5996 memfd 2.23 GB
+[2026-10-08 13:55:45] exl3xpu: nvtier last 200 steps: masked/step 110.11 nvme/step 84.41 evicts/step 116.5 host ms/step 1.27 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 1.9 GB (memfd allocated 2.2 GB) | per step: outside 72.1 ms, sync-wait 0.0 ms, host work 1.3 ms
+[2026-10-08 13:56:25] nvtier prefill prof: calls 48 fills 12813 (23.9 GB) pre(evict) 1170 ms fill 964 ms (24.8 GB/s) post(prefetch+flags) 131 ms between-calls 276283 ms
+[2026-10-08 13:56:25] exl3xpu: nvtier N130 inflight 193 admit_dropped(total) 6230 memfd 1.70 GB
+[2026-10-08 13:56:25] exl3xpu: nvtier last 200 steps: masked/step 97.05 nvme/step 137.28 evicts/step 100.8 host ms/step 1.94 prefill fills 12813 evicts 12813 (820 ms) rescued 142 ram 1.6 GB (memfd allocated 1.7 GB) | per step: outside 198.8 ms, sync-wait 0.6 ms, host work 1.3 ms
+[2026-10-08 13:56:32] exl3xpu: nvtier N130 inflight 3 admit_dropped(total) 6230 memfd 2.02 GB
+[2026-10-08 13:56:32] exl3xpu: nvtier last 200 steps: masked/step 23.95 nvme/step 19.62 evicts/step 28.6 host ms/step 0.99 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 2.0 GB (memfd allocated 2.0 GB) | per step: outside 36.0 ms, sync-wait 0.0 ms, host work 1.0 ms
+[2026-10-08 13:56:38] exl3xpu: nvtier N130 inflight 15 admit_dropped(total) 6230 memfd 2.00 GB
+[2026-10-08 13:56:38] exl3xpu: nvtier last 200 steps: masked/step 9.65 nvme/step 8.35 evicts/step 11.5 host ms/step 0.84 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 2.0 GB (memfd allocated 2.0 GB) | per step: outside 28.9 ms, sync-wait 0.0 ms, host work 0.8 ms
+[2026-10-08 13:56:44] exl3xpu: nvtier N130 inflight 6 admit_dropped(total) 6230 memfd 2.07 GB
+[2026-10-08 13:56:44] exl3xpu: nvtier last 200 steps: masked/step 16.32 nvme/step 14.04 evicts/step 18.6 host ms/step 0.91 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 2.0 GB (memfd allocated 2.1 GB) | per step: outside 30.6 ms, sync-wait 0.0 ms, host work 0.9 ms
+[2026-10-08 13:57:44] exl3xpu: nvtier N130 inflight 28 admit_dropped(total) 6238 memfd 2.11 GB
+[2026-10-08 13:57:44] exl3xpu: nvtier last 200 steps: masked/step 63.36 nvme/step 46.94 evicts/step 66.3 host ms/step 1.22 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 1.9 GB (memfd allocated 2.1 GB) | per step: outside 295.3 ms, sync-wait 0.0 ms, host work 1.2 ms
+[2026-10-08 13:57:53] exl3xpu: nvtier N130 inflight 30 admit_dropped(total) 6238 memfd 2.09 GB
+[2026-10-08 13:57:53] exl3xpu: nvtier last 200 steps: masked/step 40.06 nvme/step 32.95 evicts/step 47.0 host ms/step 1.07 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 1.9 GB (memfd allocated 2.1 GB) | per step: outside 47.0 ms, sync-wait 0.0 ms, host work 1.1 ms
+[2026-10-08 13:58:02] exl3xpu: nvtier N130 inflight 16 admit_dropped(total) 6238 memfd 2.05 GB
+[2026-10-08 13:58:02] exl3xpu: nvtier last 200 steps: masked/step 31.26 nvme/step 25.78 evicts/step 37.5 host ms/step 1.00 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 2.0 GB (memfd allocated 2.1 GB) | per step: outside 44.3 ms, sync-wait 0.0 ms, host work 1.0 ms
+[2026-10-08 13:58:12] exl3xpu: nvtier N130 inflight 15 admit_dropped(total) 6252 memfd 2.03 GB
+[2026-10-08 13:58:12] exl3xpu: nvtier last 200 steps: masked/step 38.25 nvme/step 30.91 evicts/step 44.3 host ms/step 1.19 prefill fills 0 evicts 0 (0 ms) rescued 0 ram 2.0 GB (memfd allocated 2.0 GB) | per step: outside 44.9 ms, sync-wait 0.0 ms, host work 1.2 ms

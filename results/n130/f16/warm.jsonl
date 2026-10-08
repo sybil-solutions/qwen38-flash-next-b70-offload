@@ -1,0 +1,2 @@
+{"s": 5.6, "completion": 61, "text": "Elias Elias Elias Elias Elias Elias Elias Elias Elias Elias Elias Elias Elias Elias Elias Elias Elias Elias Elias Elias Elias Elias Elias Elias Elias Elias Elias Elias Elias Elias"}
+{"s": 52.7, "completion": 1162, "text": "# Handling collisions in hash maps |  | ## Overview |  | A hash map (dictionary) maps keys to values by using a hash function to compute an index into an array of buckets or slots, from which the desired valu"}
